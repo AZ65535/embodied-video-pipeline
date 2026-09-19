@@ -39,6 +39,7 @@ def make_video(tmp_path: Path):
 
     def _make(name: str, frames: list, fps: int = 30) -> Path:
         path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)   # 允许传 "sub/1.mp4"
         writer = cv2.VideoWriter(
             str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (WIDTH, HEIGHT)
         )
@@ -103,6 +104,42 @@ def test_list_videos_rejects_missing_directory():
 
 
 # --------------------------------------------------------------------------
+# 输出名分配
+# --------------------------------------------------------------------------
+
+
+def test_video_output_prefix_keeps_flat_names_unchanged(tmp_path):
+    """平铺目录下前缀就是原来的 stem —— 现有产物的命名不受影响。"""
+    assert clean_video.video_output_prefix(tmp_path / "1.mp4", tmp_path) == "1"
+
+
+@pytest.mark.parametrize(
+    "relative, expected",
+    [
+        ("a/1.mp4", "a_1"),
+        ("a/b/1.mp4", "a_b_1"),
+        ("round1/clip 2.mp4", "round1_clip 2"),
+    ],
+)
+def test_video_output_prefix_includes_subdirectories(tmp_path, relative, expected):
+    assert clean_video.video_output_prefix(tmp_path / relative, tmp_path) == expected
+
+
+def test_assign_output_names_separates_same_stem_in_different_dirs(tmp_path):
+    videos = [tmp_path / "a" / "1.mp4", tmp_path / "b" / "1.mp4"]
+    names = clean_video.assign_output_names(videos, tmp_path)
+    assert names[videos[0]] == "a_1"
+    assert names[videos[1]] == "b_1"
+
+
+def test_assign_output_names_rejects_unavoidable_collision(tmp_path):
+    """加了目录前缀仍可能撞车（a_1.mp4 与 a/1.mp4 都得到 a_1），必须报错而不是静默覆盖。"""
+    videos = [tmp_path / "a_1.mp4", tmp_path / "a" / "1.mp4"]
+    with pytest.raises(ValueError, match="输出名冲突"):
+        clean_video.assign_output_names(videos, tmp_path)
+
+
+# --------------------------------------------------------------------------
 # 抽帧主流程
 # --------------------------------------------------------------------------
 
@@ -141,6 +178,42 @@ def test_process_video_names_files_by_source_frame_index(make_video, images_dir)
     # 30fps 采样到 5fps，步长 6：帧号必须是 0, 6, 12, ...
     for index, filename in enumerate(names):
         assert filename == f"clip_frame_{index * 6:06d}.jpg"
+
+
+def test_process_video_uses_given_output_name(make_video, images_dir):
+    video = make_video("clip.mp4", [sharp_frame() for _ in range(12)])
+    result = clean_video.process_video(
+        video, images_dir, target_fps=5, blur_threshold=100.0, output_name="sub_clip"
+    )
+    assert result[4] == "sub_clip"
+    names = sorted(p.name for p in images_dir.glob("*.jpg"))
+    assert names and all(n.startswith("sub_clip_frame_") for n in names)
+
+
+def test_nested_videos_with_the_same_stem_do_not_overwrite(make_video, tmp_path):
+    """回归：videos/a/1.mp4 与 videos/b/1.mp4 以前会写成同一批文件名，并发覆盖彼此。"""
+    root = tmp_path / "videos"
+    make_video("videos/a/1.mp4", [sharp_frame() for _ in range(12)])
+    make_video("videos/b/1.mp4", [sharp_frame() for _ in range(12)])
+
+    videos = sorted(clean_video.list_videos(root))
+    assert len(videos) == 2
+
+    names = clean_video.assign_output_names(videos, root)
+    assert sorted(names.values()) == ["a_1", "b_1"]
+
+    images_dir = tmp_path / "images"
+    for video in videos:
+        clean_video.process_video(
+            video, images_dir, target_fps=5, blur_threshold=100.0, output_name=names[video]
+        )
+
+    produced = sorted(p.name for p in images_dir.glob("*.jpg"))
+    a_files = [n for n in produced if n.startswith("a_1_frame_")]
+    b_files = [n for n in produced if n.startswith("b_1_frame_")]
+    assert a_files, "a/1.mp4 的帧没写出来"
+    assert b_files, "b/1.mp4 的帧没写出来"
+    assert len(a_files) + len(b_files) == len(produced)
 
 
 def test_process_video_reports_invariant_on_mixed_content(make_video, images_dir):

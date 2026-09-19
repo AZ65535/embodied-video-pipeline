@@ -6,7 +6,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Tuple, List
+from typing import Dict, Iterable, Optional, Tuple, List
 import time
 
 import cv2
@@ -28,6 +28,40 @@ def list_videos(input_dir: Path) -> Iterable[Path]:
     for p in input_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() == ".mp4":
             yield p
+
+
+def video_output_prefix(video_path: Path, input_dir: Path) -> str:
+    """算出该视频的输出名前缀（图片文件名和 _meta.json 的键都用它）。
+
+    规则：相对 input_dir 的路径去掉后缀，再把路径分隔符换成下划线。
+    平铺目录下结果就等于原来的 stem（行为不变）；子目录下会带上目录名，
+    这样 videos/a/1.mp4 与 videos/b/1.mp4 不会写成同一批文件名互相覆盖。
+    """
+    try:
+        relative = video_path.relative_to(input_dir)
+    except ValueError:
+        return video_path.stem  # 不在输入目录下（理论上不会发生）
+    return "_".join(relative.with_suffix("").parts)
+
+
+def assign_output_names(videos: Iterable[Path], input_dir: Path) -> Dict[Path, str]:
+    """给每个视频分配输出前缀；仍有重名时抛 ValueError。
+
+    带上目录前缀之后仍可能撞车，例如 videos/a_1.mp4 与 videos/a/1.mp4 都会得到 "a_1"。
+    这种情况必须直接报错：两个进程并发写同名文件会静默丢帧，绝不能放过去。
+    """
+    assigned: Dict[Path, str] = {}
+    owner: Dict[str, Path] = {}
+    for video in videos:
+        prefix = video_output_prefix(video, input_dir)
+        if prefix in owner:
+            raise ValueError(
+                f"输出名冲突：{owner[prefix]} 与 {video} 都会写成 {prefix}_frame_*.jpg，"
+                "并发写入会互相覆盖；请重命名其中一个，或调整目录结构"
+            )
+        owner[prefix] = video
+        assigned[video] = prefix
+    return assigned
 
 
 def is_frame_blurry(frame, threshold: float) -> bool:
@@ -53,15 +87,19 @@ def process_video(
     out_images_dir: Path,
     target_fps: int = 5,
     blur_threshold: float = 100.0,
+    output_name: Optional[str] = None,
 ) -> Tuple[int, int, int, float, str, float]:
     """抽帧并过滤模糊帧，保存清晰帧。
 
     返回 (sampled, saved, skipped_blurry, elapsed, video_name, orig_fps)；
     视频无法打开等失败情况下计数为 0、orig_fps 为 0.0。
+
+    output_name 是输出文件名前缀（同时用作 _meta.json 的键），缺省用去后缀的文件名。
+    由调用方经 assign_output_names 统一分配，避免不同子目录的同名视频互相覆盖。
     """
     logger = logging.getLogger(__name__)
     # 提前定义：异常路径下的 except 块需要返回它们
-    video_name = video_path.stem
+    video_name = output_name or video_path.stem
     saved = 0
     skipped = 0
     sampled = 0
@@ -251,6 +289,20 @@ def main() -> int:
         logger.info("No MP4 videos found in %s", input_dir)
         return 0
 
+    try:
+        output_names = assign_output_names(videos, input_dir)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+
+    nested = [vid for vid in videos if output_names[vid] != vid.stem]
+    if nested:
+        logger.info(
+            "有 %d 个视频位于子目录，输出名前缀带上了目录：%s",
+            len(nested),
+            ", ".join(f"{vid.name} -> {output_names[vid]}" for vid in nested[:5]),
+        )
+
     total_sampled = 0
     total_saved = 0
     total_skipped = 0
@@ -261,7 +313,12 @@ def main() -> int:
     with concurrent.futures.ProcessPoolExecutor() as executor:
         future_map = {
             executor.submit(
-                process_video_worker, str(vid), str(out_images_dir), args.fps, args.blur_threshold
+                process_video_worker,
+                str(vid),
+                str(out_images_dir),
+                args.fps,
+                args.blur_threshold,
+                output_names[vid],
             ): vid
             for vid in videos
         }
@@ -310,11 +367,23 @@ def main() -> int:
     return 0
 
 
-def process_video_worker(video_path_str: str, out_images_dir_str: str, target_fps: int, blur_threshold: float):
+def process_video_worker(
+    video_path_str: str,
+    out_images_dir_str: str,
+    target_fps: int,
+    blur_threshold: float,
+    output_name: str,
+):
     """可被进程池安全调用的包装函数（top-level）。"""
     video_path = Path(video_path_str)
     out_images_dir = Path(out_images_dir_str)
-    return process_video(video_path, out_images_dir, target_fps=target_fps, blur_threshold=blur_threshold)
+    return process_video(
+        video_path,
+        out_images_dir,
+        target_fps=target_fps,
+        blur_threshold=blur_threshold,
+        output_name=output_name,
+    )
 
 
 if __name__ == "__main__":
