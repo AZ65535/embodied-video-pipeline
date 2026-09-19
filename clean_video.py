@@ -1,14 +1,20 @@
 ﻿import argparse
+import concurrent.futures
+import json
 import logging
 import math
+import os
 import sys
 from pathlib import Path
-from typing import Iterable, Tuple, List
+from typing import Dict, Iterable, Tuple, List
 import time
 
 import cv2
 from tqdm import tqdm
-import concurrent.futures
+
+
+# 处理参数与原始帧率的落盘文件名，写在图片目录里，供 format_dataset.py 读取。
+IMAGES_META_FILENAME = "_meta.json"
 
 
 def list_videos(input_dir: Path) -> Iterable[Path]:
@@ -45,18 +51,19 @@ def process_video(
     out_images_dir: Path,
     target_fps: int = 5,
     blur_threshold: float = 100.0,
-) -> Tuple[int, int, int, float, str]:
+) -> Tuple[int, int, int, float, str, float]:
     """抽帧并过滤模糊帧，保存清晰帧。
 
-    返回 (sampled, saved, skipped_blurry, elapsed, video_name)；
-    视频无法打开等失败情况下计数为 0。
+    返回 (sampled, saved, skipped_blurry, elapsed, video_name, orig_fps)；
+    视频无法打开等失败情况下计数为 0、orig_fps 为 0.0。
     """
     logger = logging.getLogger(__name__)
-    # 提前定义：异常路径下的 except 块需要返回它
+    # 提前定义：异常路径下的 except 块需要返回它们
     video_name = video_path.stem
     saved = 0
     skipped = 0
     sampled = 0
+    orig_fps = 0.0
     start_ts = time.time()
 
     cap = None
@@ -111,12 +118,12 @@ def process_video(
             elapsed,
         )
 
-        return sampled, saved, skipped, elapsed, video_name
+        return sampled, saved, skipped, elapsed, video_name, orig_fps
 
     except Exception:
         logger.exception("Failed to process video: %s", video_path)
         elapsed = time.time() - start_ts
-        return sampled, saved, skipped, elapsed, video_name
+        return sampled, saved, skipped, elapsed, video_name, orig_fps
 
     finally:
         if cap is not None:
@@ -149,6 +156,75 @@ def setup_logging():
     )
 
 
+def write_images_meta(
+    out_images_dir: Path,
+    fps_by_video: Dict[str, float],
+    target_fps: int,
+    blur_threshold: float,
+    results: List[Tuple[str, int, int, int, float]],
+) -> None:
+    """把本次的运行参数和每个视频的原始帧率写到 out_images_dir/_meta.json。
+
+    必须由父进程在所有 future 收集完毕后调用一次：子进程各写各的会互相覆盖。
+    已存在的条目会保留（支持增量追加到同一目录），orig_fps 为 0 的失败视频不写入。
+    """
+    logger = logging.getLogger("clean_video")
+    meta_path = out_images_dir / IMAGES_META_FILENAME
+
+    payload: dict = {}
+    if meta_path.exists():
+        try:
+            loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError):
+            logger.warning("已有的 %s 无法解析，将重新生成", meta_path)
+
+    videos = payload.get("videos")
+    if not isinstance(videos, dict):
+        videos = {}
+
+    stats = {
+        name: (sampled, saved, skipped, elapsed)
+        for name, sampled, saved, skipped, elapsed in results
+    }
+    for video_name, orig_fps in fps_by_video.items():
+        if orig_fps <= 0:
+            continue
+        sampled, saved, skipped, elapsed = stats.get(video_name, (0, 0, 0, 0.0))
+        videos[video_name] = {
+            "orig_fps": round(float(orig_fps), 6),
+            "frame_step": max(1, int(round(orig_fps / float(target_fps)))) if target_fps > 0 else 1,
+            "sampled": sampled,
+            "saved": saved,
+            "skipped_blurry": skipped,
+            "elapsed": round(elapsed, 3),
+        }
+
+    payload.update(
+        {
+            "format": 1,
+            "tool": "clean_video.py",
+            "target_fps": target_fps,
+            "blur_threshold": blur_threshold,
+            "videos": videos,
+        }
+    )
+
+    # 先写临时文件再替换，避免中途崩溃留下半截 JSON
+    tmp_path = meta_path.parent / (meta_path.name + ".tmp")
+    try:
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(tmp_path, meta_path)
+    except OSError:
+        logger.exception("写入 %s 失败", meta_path)
+        return
+
+    logger.info("已写入 %s（累计 %d 个视频的原始帧率）", meta_path, len(videos))
+
+
 def main() -> int:
     args = parse_args()
     logger = logging.getLogger("clean_video")
@@ -177,6 +253,7 @@ def main() -> int:
     total_saved = 0
     total_skipped = 0
     results: List[Tuple[str, int, int, int, float]] = []
+    fps_by_video: Dict[str, float] = {}
 
     start_all = time.time()
     with concurrent.futures.ProcessPoolExecutor() as executor:
@@ -190,11 +267,13 @@ def main() -> int:
         for fut in concurrent.futures.as_completed(future_map):
             vid = future_map[fut]
             try:
-                sampled, saved, skipped, elapsed, video_name = fut.result()
+                sampled, saved, skipped, elapsed, video_name, orig_fps = fut.result()
             except Exception:
                 logger.exception("Processing failed for %s", vid)
                 continue
 
+            if orig_fps > 0:
+                fps_by_video[video_name] = orig_fps
             results.append((video_name, sampled, saved, skipped, elapsed))
             total_sampled += sampled
             total_saved += saved
@@ -224,6 +303,8 @@ def main() -> int:
         total_skipped,
         total_elapsed,
     )
+
+    write_images_meta(out_images_dir, fps_by_video, args.fps, args.blur_threshold, results)
     return 0
 
 
