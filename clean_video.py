@@ -34,7 +34,9 @@ def is_frame_blurry(frame, threshold: float) -> bool:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     score = lap.var()
-    return score < threshold
+    # lap.var() 是 numpy 标量，比较结果是 np.bool_ 而非内置 bool；
+    # 显式转换以符合类型标注，也避免调用方 is True 之类的判断意外失败。
+    return bool(score < threshold)
 
 
 def save_frame(frame, out_dir: Path, video_name: str, frame_number: int) -> Path:

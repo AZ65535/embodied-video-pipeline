@@ -290,7 +290,7 @@ def scan_input(input_dir: Path, counters: Counters) -> List[EpisodePlan]:
                 "跳过重复帧：%s 的帧号 %d 已由 %s 提供，忽略 %s",
                 video_name,
                 source_frame,
-                grouped[video_name][source_frame].name,
+                grouped[video_name][source_frame][0].name,
                 path.name,
             )
             counters.duplicate += 1
