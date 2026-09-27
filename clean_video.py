@@ -20,8 +20,7 @@ IMAGES_META_FILENAME = "_meta.json"
 def list_videos(input_dir: Path) -> Iterable[Path]:
     """返回输入目录下的所有 mp4 视频路径（递归，后缀大小写不敏感）。
 
-    单次遍历后按后缀过滤：Windows 上 glob 匹配大小写不敏感，
-    原先 "*.mp4" / "*.MP4" 两轮 rglob 会把同一文件匹配两次、重复处理。
+    单次遍历后过滤：Windows 上 glob 大小写不敏感，两轮 rglob 会重复匹配同一文件。
     """
     if not input_dir.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_dir}")
@@ -33,9 +32,8 @@ def list_videos(input_dir: Path) -> Iterable[Path]:
 def video_output_prefix(video_path: Path, input_dir: Path) -> str:
     """算出该视频的输出名前缀（图片文件名和 _meta.json 的键都用它）。
 
-    规则：相对 input_dir 的路径去掉后缀，再把路径分隔符换成下划线。
-    平铺目录下结果就等于原来的 stem（行为不变）；子目录下会带上目录名，
-    这样 videos/a/1.mp4 与 videos/b/1.mp4 不会写成同一批文件名互相覆盖。
+    规则：相对 input_dir 的路径去掉后缀，路径分隔符换成下划线。平铺目录下
+    结果就是原来的 stem；子目录下带上目录名，避免同名视频互相覆盖。
     """
     try:
         relative = video_path.relative_to(input_dir)
@@ -47,8 +45,8 @@ def video_output_prefix(video_path: Path, input_dir: Path) -> str:
 def assign_output_names(videos: Iterable[Path], input_dir: Path) -> Dict[Path, str]:
     """给每个视频分配输出前缀；仍有重名时抛 ValueError。
 
-    带上目录前缀之后仍可能撞车，例如 videos/a_1.mp4 与 videos/a/1.mp4 都会得到 "a_1"。
-    这种情况必须直接报错：两个进程并发写同名文件会静默丢帧，绝不能放过去。
+    带目录前缀后仍可能撞车（videos/a_1.mp4 与 videos/a/1.mp4 都得到 "a_1"）。
+    必须直接报错：并发写同名文件会静默丢帧。
     """
     assigned: Dict[Path, str] = {}
     owner: Dict[str, Path] = {}
@@ -68,8 +66,7 @@ def is_frame_blurry(frame, threshold: float) -> bool:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     lap = cv2.Laplacian(gray, cv2.CV_64F)
     score = lap.var()
-    # lap.var() 是 numpy 标量，比较结果是 np.bool_ 而非内置 bool；
-    # 显式转换以符合类型标注，也避免调用方 is True 之类的判断意外失败。
+    # lap.var() 是 numpy 标量，比较结果是 np.bool_，显式转成内置 bool
     return bool(score < threshold)
 
 
@@ -77,7 +74,6 @@ def save_frame(frame, out_dir: Path, video_name: str, frame_number: int) -> Path
     out_dir.mkdir(parents=True, exist_ok=True)
     fname = f"{video_name}_frame_{frame_number:06d}.jpg"
     out_path = out_dir / fname
-    # 使用 JPEG 保存，质量默认
     cv2.imwrite(str(out_path), frame)
     return out_path
 
@@ -92,10 +88,7 @@ def process_video(
     """抽帧并过滤模糊帧，保存清晰帧。
 
     返回 (sampled, saved, skipped_blurry, elapsed, video_name, orig_fps)；
-    视频无法打开等失败情况下计数为 0、orig_fps 为 0.0。
-
-    output_name 是输出文件名前缀（同时用作 _meta.json 的键），缺省用去后缀的文件名。
-    由调用方经 assign_output_names 统一分配，避免不同子目录的同名视频互相覆盖。
+    失败时计数为 0、orig_fps 为 0.0。output_name 由 assign_output_names 统一分配。
     """
     logger = logging.getLogger(__name__)
     # 提前定义：异常路径下的 except 块需要返回它们
@@ -203,10 +196,10 @@ def write_images_meta(
     blur_threshold: float,
     results: List[Tuple[str, int, int, int, float]],
 ) -> None:
-    """把本次的运行参数和每个视频的原始帧率写到 out_images_dir/_meta.json。
+    """把运行参数和每个视频的原始帧率写到 out_images_dir/_meta.json。
 
-    必须由父进程在所有 future 收集完毕后调用一次：子进程各写各的会互相覆盖。
-    已存在的条目会保留（支持增量追加到同一目录），orig_fps 为 0 的失败视频不写入。
+    必须由父进程在收齐所有 future 后调一次：子进程各写各的会互相覆盖。
+    已有条目保留（支持增量追加），orig_fps 为 0 的失败视频不写入。
     """
     logger = logging.getLogger("clean_video")
     meta_path = out_images_dir / IMAGES_META_FILENAME
@@ -348,7 +341,6 @@ def main() -> int:
 
     total_elapsed = time.time() - start_all
 
-    # 打印 Benchmark 汇总表
     logger.info("\n=== Benchmark Results ===")
     logger.info("%-40s %8s %8s %9s %10s", "video", "sampled", "saved", "filter%", "time(s)")
     for video_name, sampled, saved, skipped, elapsed in results:

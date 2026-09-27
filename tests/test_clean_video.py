@@ -1,8 +1,6 @@
 """clean_video.py 的测试。
 
-需要 cv2，所以单独成文件 —— format_dataset 是纯标准库的，
-不希望它的测试因为这里的导入失败而一起挂掉。
-
+需要 cv2 所以单独成文件 —— format_dataset 是纯标准库的，不该因这里的导入失败一起挂。
 视频用 cv2.VideoWriter 现场合成，不依赖仓库里的 videos/。
 """
 

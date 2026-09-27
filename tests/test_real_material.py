@@ -1,11 +1,9 @@
 """依赖仓库里真实素材的慢速测试。
 
-`videos/` 和 `output/` 都在 `.gitignore` 里，所以这些用例在别人的机器上会自动跳过 ——
-它们的价值是在**你自己的机器上**验证真实数据，而不是进 CI。
+`videos/` 和 `output/` 都在 `.gitignore` 里，所以在别人的机器上会自动跳过 ——
+这些用例的价值是在自己的机器上验证真实数据，不进 CI。
 
-默认不运行（`pytest.ini` 里 `addopts = -m "not slow"`），要跑：
-
-    pytest -m slow
+默认不跑（`pytest.ini` 里 `addopts = -m "not slow"`），要跑：`pytest -m slow`
 """
 
 from pathlib import Path

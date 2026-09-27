@@ -1,14 +1,10 @@
 """共享的测试夹具。
 
-两条硬约束：
+夹具不依赖 `videos/` 和 `output/`（都在 `.gitignore` 里，换台机器克隆下来就没有），
+产物一律写在 `tmp_path` 下；真实素材只在 `test_real_material.py` 里以 skip 形式覆盖。
 
-1. **不依赖 `videos/` 和 `output/`** —— 两者都在 `.gitignore` 里，换台机器克隆下来就没有。
-   真实素材只在 `test_real_material.py` 里以 `skip` 的形式覆盖。
-2. **所有产物写在 `tmp_path` 下** —— 测试不碰仓库里的任何目录。
-
-这里刻意不 import `clean_video`：它会连带拉起 cv2 / tqdm，
-而 `format_dataset` 是纯标准库的，不希望它的测试被拖下水。
-需要 `clean_video` 的夹具放在 `test_clean_video.py` 里。
+刻意不 import `clean_video`：它会连带拉起 cv2 / tqdm，而 `format_dataset` 是纯标准
+库的；需要 `clean_video` 的夹具放在 `test_clean_video.py` 里。
 """
 
 import itertools
@@ -43,11 +39,9 @@ def tiny_jpegs(fixtures_dir: Path) -> list:
 def make_images(tmp_path: Path, tiny_jpegs: list):
     """造一个假的 output/images 目录。
 
-    spec 形如 ``{"1": [0, 6, 12], "2": [0, 5]}``，值是该视频**保留下来的原始帧号**
-    —— 中间跳过的号就是被 clean_video.py 判定为模糊而丢弃的帧。
-
-    extra_files 用来塞入干扰文件，值是 bytes 或 str；mixed_sizes=True 时让图片尺寸交错，
-    用于测试 info.json 的「多尺寸」告警路径。
+    spec 形如 ``{"1": [0, 6, 12], "2": [0, 5]}``，值是该视频保留下来的原始帧号
+    （跳过的号就是被 clean_video.py 判为模糊丢掉的帧）；extra_files 塞干扰文件，
+    mixed_sizes=True 让尺寸交错，用于测 info.json 的「多尺寸」告警路径。
     """
     counter = itertools.count()
 

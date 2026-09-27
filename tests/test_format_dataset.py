@@ -1,7 +1,4 @@
-"""format_dataset.py 的测试。
-
-分三段：纯函数单测、端到端集成、以及锁住本次开发中实际踩到的坑的回归测试。
-"""
+"""format_dataset.py 的测试。"""
 
 import json
 import logging
@@ -147,10 +144,9 @@ def test_infer_frame_step_needs_at_least_two_frames(frame_numbers):
 
 
 def test_infer_frame_step_single_diff_overestimates():
-    """已知局限：只有一帧时 gcd 就是那个差值本身。
+    """已知局限：只有一帧时 gcd 就是那个差值本身（刻意如此）。
 
-    这是刻意的行为记录 —— 也正因如此，反推值只当兜底，
-    权威来源始终是 _meta.json 里 clean_video.py 记下的值。
+    所以反推值只当兜底，权威来源始终是 _meta.json 里 clean_video.py 记下的值。
     """
     assert fd.infer_frame_step(entries(0, 12)) == 12
 

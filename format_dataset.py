@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""把 clean_video.py 抽出的清晰帧整理成仿 LeRobot v2.0 布局的数据集骨架。
+"""把 clean_video.py 抽出的清晰帧整理成帧清单（中间产物）。
 
-仅依赖 Python 标准库（未引入 pyarrow / lerobot / 任何图像库）。
+管线第二步，产物 dataset/ 供 export_lerobot.py 消费。仅依赖 Python 标准库
+（未引入 pyarrow / lerobot / 任何图像库）。
 
-产物与上游 LeRobot v2.0 的差异、以及本脚本做不到的事情，
-全部记录在生成出来的 meta/README.md 里，请以那份文档为准。
+与上游 LeRobot 的差异、以及本脚本做不到的事情，见生成出来的 meta/README.md。
 """
 
 import argparse
@@ -21,18 +21,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 形如 "1_frame_000318.jpg"：视频名用贪婪匹配，取最后一个 "_frame_" 作为分隔，
-# 这样视频名本身含下划线、甚至含 "_frame_" 也能正确切分。
+# 形如 "1_frame_000318.jpg"：视频名贪婪匹配，取最后一个 "_frame_" 作分隔，
+# 这样视频名本身含下划线甚至含 "_frame_" 也能正确切分。
 FRAME_NAME_RE = re.compile(r"^(?P<video>.+)_frame_(?P<frame>\d+)\.(?:jpg|jpeg)$", re.IGNORECASE)
 
-# JPEG SOF 标记：C0-CF 里除 C4(DHT)/C8(JPG)/CC(DAC) 之外都是帧头，携带宽高。
+# JPEG SOF 标记：C0-CF 里除 C4(DHT)/C8(JPG)/CC(DAC) 之外都是帧头，携带宽高
 SOF_MARKERS = frozenset(
     {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
 )
 # 无长度字段的独立标记：TEM / RST0-7 / SOI / EOI
 STANDALONE_MARKERS = frozenset({0x01, 0xD8, 0xD9, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7})
 
-# Windows 传统 MAX_PATH 上限；超出时部分 API 会莫名失败，提前告警。
+# Windows 传统 MAX_PATH 上限；超出时部分 API 会莫名失败，提前告警
 WINDOWS_PATH_WARN_LENGTH = 250
 
 DEFAULT_CAMERA = "front"
@@ -99,8 +99,8 @@ def parse_frame_name(path: Path) -> Optional[Tuple[str, int]]:
 def probe_jpeg(path: Path) -> Optional[Tuple[int, int]]:
     """只读 JPEG 头部，返回 (width, height)。
 
-    顺带充当完整性校验：结构不对（缺 SOI、段长非法、SOS 之前没有 SOF）
-    一律返回 None，调用方据此跳过并计入损坏帧。
+    顺带充当完整性校验：结构不对（缺 SOI、段长非法、SOS 前无 SOF）返回 None，
+    调用方据此跳过并计入损坏帧。
     """
     try:
         with path.open("rb") as handle:
@@ -199,9 +199,8 @@ def extract_source_fps(images_meta: dict) -> Dict[str, float]:
 def infer_frame_step(frames: List[FrameEntry]) -> Optional[int]:
     """从原始帧号的间隔反推抽帧步长。
 
-    clean_video.py 按固定步长采样，所以相邻保留帧的帧号差一定是步长的整数倍；
-    对全部差值取 gcd 即可还原步长 —— 被丢掉的模糊帧只会把差值抬成步长的倍数，
-    但只要存在任意一对相邻保留帧没被丢，gcd 就等于步长本身。
+    clean_video.py 按固定步长采样，相邻保留帧的帧号差必是步长的整数倍。被丢的
+    模糊帧只会把差值抬成倍数，所以对全部差值取 gcd 就能还原步长。
     """
     if len(frames) < 2:
         return None
