@@ -62,12 +62,19 @@ def assign_output_names(videos: Iterable[Path], input_dir: Path) -> Dict[Path, s
     return assigned
 
 
-def is_frame_blurry(frame, threshold: float) -> bool:
+def blur_score(frame) -> float:
+    """Laplacian 方差，越大越清晰。
+
+    calibrate_blur.py 也调用这个函数算分位数 —— 必须共用同一个实现，
+    否则标定出的分布与实际过滤时看到的分数不是一回事，标定就没有意义了。
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    lap = cv2.Laplacian(gray, cv2.CV_64F)
-    score = lap.var()
-    # lap.var() 是 numpy 标量，比较结果是 np.bool_，显式转成内置 bool
-    return bool(score < threshold)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def is_frame_blurry(frame, threshold: float) -> bool:
+    # blur_score 已转成内置 float，比较结果就是内置 bool
+    return blur_score(frame) < threshold
 
 
 def save_frame(frame, out_dir: Path, video_name: str, frame_number: int) -> Path:
