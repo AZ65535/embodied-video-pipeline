@@ -9,8 +9,13 @@ pytest
 # lerobot 的依赖很重（torch、torchvision、datasets、av、wandb……，约 1~2 GB），
 # 只跑前两步的话不需要装。
 #
-# 注意 lerobot 会要求 opencv-python-headless，而它和 opencv-python 抢同一个 cv2/
-# 目录，装完会把前两步用的 cv2 覆盖掉（headless 没有 GUI 功能）。详见 README
-# 「第三步」一节的说明。
+# 必须限定版本：lerobot 的**包版本决定数据集格式版本**（0.3.x = v2.1，0.4.x = v3.0），
+# 而本项目的代码依赖两处 lerobot 内部行为 —— 时间戳注入读写的 episode_buffer 结构，
+# 以及 v3.0 的目录布局。升到 0.5 大概率会换格式并让脚本失效。
 pillow
-lerobot
+lerobot>=0.4.4,<0.5
+
+# 另外：lerobot 依赖 opencv-python-headless，它与 opencv-python 共用同一个 cv2/
+# 目录，安装后会把前两步用的 cv2 覆盖成 headless 版（无 GUI 功能）。
+# 恢复方法见 README「第三步 → 注意事项」。
+

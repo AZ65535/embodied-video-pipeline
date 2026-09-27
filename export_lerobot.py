@@ -236,7 +236,18 @@ def write_dataset(
     """调 lerobot 的官方 API 把数据集写出来，返回写入的帧数。"""
     # 延迟导入：lerobot 会连带拉起 torch，要好几秒。放函数里，
     # 本模块不碰 lerobot 的纯逻辑测试就能保持秒级。
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot import __version__ as lerobot_version
+    from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
+
+    # 版本决定格式（0.3.x 写 v2.1，0.4.x 写 v3.0），而本项目针对 0.4.4 / v3.0 开发验证。
+    # requirements.txt 里已 pin，但那只挡 pip 安装；这里把实际版本打出来便于排查。
+    logger.info("lerobot %s，输出格式 %s", lerobot_version, CODEBASE_VERSION)
+    if CODEBASE_VERSION != "v3.0":
+        logger.warning(
+            "当前 lerobot 输出的是 %s 格式，本项目针对 v3.0 开发验证，"
+            "产物布局可能与 README 描述不一致",
+            CODEBASE_VERSION,
+        )
 
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
