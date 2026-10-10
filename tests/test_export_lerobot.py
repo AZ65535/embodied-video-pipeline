@@ -30,17 +30,35 @@ def run_export(monkeypatch):
 
 
 @pytest.fixture
-def built_dataset(make_images, run_format, tmp_path):
-    """先用第二步造一个 dataset/ 目录，供第三步消费。"""
+def built_dataset(make_images, write_meta, write_scores, run_format, tmp_path):
+    """先用第二步造一个 dataset/ 目录，供第三步消费。
+
+    默认每帧都是清晰帧（分数 250）。要用模糊帧就传 scores=。
+    """
     counter = itertools.count()
 
-    def _build(spec: dict, **make_kwargs) -> Path:
+    def _build(spec: dict, scores: dict = None, **make_kwargs) -> Path:
         images = make_images(spec, **make_kwargs)
+        # 原始帧率要与帧号间隔自洽，否则 format_dataset 会报「不符」
+        write_meta(images, {video: _implied_fps(frames) for video, frames in spec.items()})
+        write_scores(
+            images,
+            scores
+            if scores is not None
+            else {video: {frame: 250.0 for frame in frames} for video, frames in spec.items()},
+        )
         out = tmp_path / f"ds{next(counter)}"
         assert run_format("--input", images, "--output", out) == 0
         return out
 
     return _build
+
+
+def _implied_fps(frame_numbers: list, target_fps: int = 5) -> float:
+    """从帧号间隔反推出自洽的原始帧率（单帧时无从推断，给个名义值）。"""
+    if len(frame_numbers) < 2:
+        return 30.0
+    return float((frame_numbers[1] - frame_numbers[0]) * target_fps)
 
 
 def episodes_of(dataset_dir: Path):
@@ -120,27 +138,32 @@ def test_resolve_camera_shape_rejects_unknown_camera(built_dataset):
         ex.resolve_camera_shape(read_info(dataset_dir), "observation.images.wrist")
 
 
-def test_build_features_declares_source_frame():
-    """自定义特征必须声明，否则 add_frame 会因为「多余字段」报错。
-
-    真实时间轴靠改写 lerobot 的 timestamp 列承载（见 inject_real_timestamp），
-    所以这里不该再有第二个时间戳列。
-    """
+def test_build_features_declares_custom_columns():
+    """自定义特征必须声明，否则 add_frame 会因为「多余字段」报错。"""
     features = ex.build_features("observation.images.front", 1080, 1920)
-    assert features["observation.images.front"]["dtype"] == "image"
+    # "video" 而不是 "image"：帧编码成 mp4，不嵌进 parquet。标错的话
+    # streaming_encoding 不会生效，也会退回那条会撞 2 GB arrow 限制的路径。
+    assert features["observation.images.front"]["dtype"] == "video"
     assert features["observation.images.front"]["shape"] == (1080, 1920, 3)
     # (1,) 是元组不是列表：lerobot 靠 `shape == (1,)` 判定成标量列
     assert features[ex.SOURCE_FRAME_KEY]["shape"] == (1,)
     assert features[ex.SOURCE_FRAME_KEY]["dtype"] == "int64"
-    assert sorted(features) == ["observation.images.front", ex.SOURCE_FRAME_KEY]
+    assert features[ex.BLUR_SCORE_KEY]["shape"] == (1,)
+    assert features[ex.BLUR_SCORE_KEY]["dtype"] == "float32"
+    assert sorted(features) == [
+        ex.BLUR_SCORE_KEY,
+        "observation.images.front",
+        ex.SOURCE_FRAME_KEY,
+    ]
 
 
 # --------------------------------------------------------------------------
-# 分组与时间戳
+# 分组与时间轴
 # --------------------------------------------------------------------------
 
 
-def frames_of(*episodes_and_counts):
+def frames_of(*episodes_and_counts, fps=30.0, blur_score=250.0):
+    """造一批帧清单行；默认是均匀网格（步长 6，对应 30fps 采样到 5fps）。"""
     rows = []
     index = 0
     for episode_index, count in episodes_and_counts:
@@ -151,7 +174,8 @@ def frames_of(*episodes_and_counts):
                     "episode_index": episode_index,
                     "frame_index": position,
                     "source_frame": position * 6,
-                    "timestamp": round(position * 0.2, 6),
+                    "blur_score": blur_score,
+                    "timestamp": round(position * 6 / fps, 6),
                     "path": f"videos/x/episode_{episode_index:06d}/frame_{position:06d}.jpg",
                 }
             )
@@ -190,51 +214,106 @@ def test_group_episodes_rejects_empty_episode():
         ex.group_episodes(rows, episodes)
 
 
-def test_frame_timestamp_prefers_recorded_value():
-    """真实时间轴来自 frames.jsonl，不能被名义值覆盖。"""
-    assert ex.frame_timestamp({"timestamp": 0.8}, position=1, fps=5) == 0.8
+# --------------------------------------------------------------------------
+# 时间轴：帧是否落在均匀网格上
+# --------------------------------------------------------------------------
 
 
-def test_frame_timestamp_falls_back_to_nominal():
-    """手工构造的清单可能缺 timestamp，兜底成 position/fps。"""
-    assert ex.frame_timestamp({}, position=3, fps=5) == 0.6
+def grid_episode(fps, source_frames, episode_index=0):
+    rows = [
+        {
+            "episode_index": episode_index,
+            "frame_index": position,
+            "source_frame": source_frame,
+            "blur_score": 250.0,
+            "path": f"videos/x/frame_{position:06d}.jpg",
+        }
+        for position, source_frame in enumerate(source_frames)
+    ]
+    return ex.EpisodeFrames(episode_index, "v1", fps, rows)
 
 
-def test_frame_timestamp_ignores_bool():
-    """bool 是 int 的子类，必须排除，否则 True 会变成 1.0。"""
-    assert ex.frame_timestamp({"timestamp": True}, position=2, fps=5) == 0.4
+class FakeEncoder:
+    def __init__(self, dropped=None):
+        self._dropped_frames = dropped if dropped is not None else {}
 
 
-class FakeDataset:
-    """只带 episode_buffer 的假数据集，用来单测时间戳注入。"""
-
-    def __init__(self, timestamp=None):
-        self.episode_buffer = {} if timestamp is None else {"timestamp": timestamp}
-
-    @classmethod
-    def without_buffer(cls):
-        return cls.__new__(cls)     # 连 episode_buffer 属性都没有
+def test_encoder_drop_check_passes_when_nothing_was_dropped(caplog):
+    dataset = type("D", (), {"_streaming_encoder": FakeEncoder()})()
+    with caplog.at_level(logging.WARNING):
+        ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-def test_inject_real_timestamp_overwrites_only_the_last_entry():
-    """改的是刚追加的那一帧，前面已经写好的不能被碰。"""
-    dataset = FakeDataset(timestamp=[0.0, 0.2])
-    ex.inject_real_timestamp(dataset, 0.8)
-    assert dataset.episode_buffer["timestamp"] == [0.0, 0.8]
+def test_encoder_drop_check_fails_loudly_on_dropped_frames():
+    """丢帧意味着视频比 parquet 少几帧，帧网格不再均匀 —— 必须炸，不能只 warning。"""
+    dataset = type("D", (), {"_streaming_encoder": FakeEncoder({"observation.images.front": 3})})()
+    with pytest.raises(RuntimeError, match="丢了 3 帧"):
+        ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
 
 
-@pytest.mark.parametrize(
-    "dataset_factory, expected",
-    [
-        (FakeDataset.without_buffer, "episode_buffer 结构变了"),
-        (lambda: FakeDataset(timestamp={"not": "a list"}), "episode_buffer 结构变了"),
-        (lambda: FakeDataset(timestamp=[]), "是空的"),
-    ],
-)
-def test_inject_real_timestamp_fails_loudly(dataset_factory, expected):
-    """lerobot 内部结构一变就必须炸，不能静默退回标称时间轴。"""
-    with pytest.raises(RuntimeError, match=expected):
-        ex.inject_real_timestamp(dataset_factory(), 0.8)
+def test_encoder_drop_check_warns_when_lerobot_changed(caplog):
+    """读不到计数时告警说明「没能核对」，而不是假装核对过了。"""
+    dataset = type("D", (), {"_streaming_encoder": object()})()
+    with caplog.at_level(logging.WARNING):
+        ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
+    assert "无法核对" in caplog.text
+
+
+def test_grid_check_passes_on_a_uniform_grid():
+    """正常产物：帧号按步长连续，原始帧率是处理帧率的整数倍。"""
+    assert ex.check_frame_grid([grid_episode(30.0, [0, 6, 12, 18])], fps=5) == []
+    assert ex.check_frame_grid([grid_episode(25.0, [0, 5, 10, 15])], fps=5) == []
+
+
+def test_grid_check_tolerates_a_trailing_fps_tail():
+    """30.00005 这类带尾数的原始帧率不能误报 —— 偏差远小于一帧。"""
+    assert ex.check_frame_grid([grid_episode(30.00005, [0, 6, 12])], fps=5) == []
+
+
+def test_grid_check_flags_non_contiguous_frame_numbers():
+    """帧号有缺口时 lerobot 会按 frame_index 取到错误的时间点。"""
+    warnings = ex.check_frame_grid([grid_episode(30.0, [0, 6, 12, 24])], fps=5)
+    assert len(warnings) == 1
+    assert "帧号间隔不均匀" in warnings[0]
+    assert "delta_timestamps" in warnings[0]
+
+
+def test_grid_check_flags_a_fractional_fps_ratio():
+    """24fps 采样到 5fps：步长取 5，但 5/24 秒 ≠ 1/5 秒，时间戳会累积偏差。"""
+    warnings = ex.check_frame_grid([grid_episode(24.0, [0, 5, 10, 15])], fps=5)
+    assert len(warnings) == 1
+    assert "不是处理帧率" in warnings[0]
+    assert "8.3 ms" in warnings[0]      # |1/5 - 5/24| * 1000
+
+
+def test_grid_check_flags_a_step_that_contradicts_the_recorded_fps():
+    """帧均匀，但间隔与记录的原始帧率对不上 —— 说明记录和素材不是同一批。"""
+    warnings = ex.check_frame_grid([grid_episode(30.0, [0, 5, 10])], fps=5)
+    assert len(warnings) == 1
+    assert "帧号间隔是 5" in warnings[0]
+    assert "应为 6" in warnings[0]
+
+
+def test_grid_check_skips_the_gap_check_without_source_frame():
+    """source_frame 可缺省，缺了就不能拿默认值硬凑间隔 —— 那会误报。"""
+    rows = [
+        {"episode_index": 0, "frame_index": i, "blur_score": 250.0, "path": f"f{i}.jpg"}
+        for i in range(3)
+    ]
+    episode = ex.EpisodeFrames(0, "v1", 30.0, rows)
+    assert ex.check_frame_grid([episode], fps=5) == []
+
+
+def test_grid_check_flags_a_missing_source_fps():
+    warnings = ex.check_frame_grid([grid_episode(None, [0, 6, 12])], fps=5)
+    assert len(warnings) == 1
+    assert "没有可用的原始帧率" in warnings[0]
+
+
+def test_a_single_frame_episode_is_vacuous():
+    """只有一帧时无从判断间隔，不该因此报警。"""
+    assert ex.check_frame_grid([grid_episode(30.0, [0])], fps=5) == []
 
 
 # --------------------------------------------------------------------------
@@ -352,7 +431,10 @@ def test_end_to_end_is_loadable_by_lerobot(built_dataset, run_export, tmp_path, 
     文件看起来在、实际加载不了。"""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    dataset_dir = built_dataset({"1": [0, 6, 12, 24], "2": [0, 5]})
+    dataset_dir = built_dataset(
+        {"1": [0, 6, 12, 18], "2": [0, 5]},
+        scores={"1": {0: 250.0, 6: 42.0, 12: 99.9, 18: 300.0}, "2": {0: 180.0, 5: 250.0}},
+    )
     out = tmp_path / "lr"
     assert run_export("--input", dataset_dir, "--output", out) == 0
 
@@ -361,14 +443,50 @@ def test_end_to_end_is_loadable_by_lerobot(built_dataset, run_export, tmp_path, 
     assert ds.num_episodes == 2
 
     # 原始帧号必须原样活下来
-    assert [int(ds[i]["source_frame"]) for i in range(6)] == [0, 6, 12, 24, 0, 5]
-    # 帧 18 被当模糊帧丢了，timestamp 必须从 0.4 跳到 0.8。
-    # 没有 inject_real_timestamp() 的话这里会是 0.6（frame_index/fps）。
+    assert [int(ds[i]["source_frame"]) for i in range(6)] == [0, 6, 12, 18, 0, 5]
+    # 模糊分数原样活下来，下游据此自行筛选
+    assert [float(ds[i]["blur_score"]) for i in range(6)] == pytest.approx(
+        [250.0, 42.0, 99.9, 300.0, 180.0, 250.0], abs=1e-4
+    )
+    # 帧按 1/fps 等间隔，timestamp 就是 frame_index / fps
     assert [float(ds[i]["timestamp"]) for i in range(4)] == pytest.approx(
-        [0.0, 0.2, 0.4, 0.8], abs=1e-6
+        [0.0, 0.2, 0.4, 0.6], abs=1e-6
     )
     height, width = fixture_hw
     assert tuple(ds[0]["observation.images.front"].shape) == (3, height, width)
+
+
+@pytest.mark.slow
+def test_delta_timestamps_lands_on_the_requested_times(built_dataset, run_export, tmp_path):
+    """整个改动的目的：帧落在均匀网格上，时序窗口才取得到正确的时间点。
+
+    改这个设计之前，帧因为丢模糊帧而不均匀，delta_timestamps 会静默取到别的时刻。
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset_dir = built_dataset({"1": [0, 6, 12, 18, 24]})
+    out = tmp_path / "lr"
+    assert run_export("--input", dataset_dir, "--output", out) == 0
+
+    # 注意 timestamp 不能放进 delta_timestamps：视频型数据集解码时要读标量
+    # item["timestamp"]，开了窗口就变成多元素张量，lerobot 会在这里崩。
+    # 这不影响用 source_frame 验证窗口取位。
+    windowed = LeRobotDataset(
+        "local/embodied-videos",
+        root=out,
+        delta_timestamps={
+            "observation.images.front": [-0.2, 0.0, 0.2],
+            "source_frame": [-0.2, 0.0, 0.2],
+        },
+    )
+    frame = windowed[2]
+    # 请求「当前帧前后各 0.2 秒」（fps=5，即前后各一帧）——
+    # 取到的正是相邻帧。帧不均匀时这里会取到别的帧。
+    assert frame["source_frame"].tolist() == [6, 12, 18]
+    # 三帧都是真实取到的，没有靠填充补齐
+    assert frame["source_frame_is_pad"].tolist() == [False, False, False]
+    # 单帧字段仍在，说明窗口只作用于列进 delta_timestamps 的那些键
+    assert float(frame["timestamp"]) == pytest.approx(0.4, abs=1e-6)
 
 
 @pytest.mark.slow

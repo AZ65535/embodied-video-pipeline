@@ -39,6 +39,10 @@ DEFAULT_CAMERA = "front"
 
 # clean_video.py 写在图片目录里的处理参数与原始帧率记录。
 IMAGES_META_FILENAME = "_meta.json"
+# clean_video.py 写的每帧模糊分数。
+BLUR_SCORES_FILENAME = "_scores.jsonl"
+# 输入目录里以下划线开头的文件都是上游的元数据，不是帧图片。
+METADATA_PREFIX = "_"
 
 # 原始帧率的三种来源，会写进 info.json / README，方便判断 timestamp 可不可信。
 FPS_ORIGIN_RECORDED = "_meta.json"           # 精确
@@ -54,11 +58,17 @@ class FrameEntry:
     source_frame: int
     width: int
     height: int
+    # 两个字段都可能是 None：旧版 clean_video.py 没留下 _scores.jsonl
+    blur_score: Optional[float] = None
+    is_blurry: Optional[bool] = None
 
 
 @dataclass
 class EpisodePlan:
-    """一个源视频对应的 episode（尚未落盘）。"""
+    """一个 episode（尚未落盘）。
+
+    一个源视频可能被切成多段，每段是一个 episode（见 --max-episode-seconds）。
+    """
 
     episode_index: int
     source_video: str
@@ -69,6 +79,9 @@ class EpisodePlan:
     source_fps_origin: Optional[str] = None
     # 从原始帧号的间隔反推出的抽帧步长
     observed_step: Optional[int] = None
+    # 该视频被切成的第几段（0 起）；不切分时恒为 0
+    segment_index: int = 0
+    segment_count: int = 1
 
 
 @dataclass
@@ -196,11 +209,64 @@ def extract_source_fps(images_meta: dict) -> Dict[str, float]:
     return result
 
 
+def load_blur_scores(input_dir: Path) -> Dict[str, Dict[int, float]]:
+    """读取 clean_video.py 写下的 _scores.jsonl，返回 {视频名: {原始帧号: 分数}}。
+
+    文件缺失时返回空字典而不是报错：改造前的产物目录没有这个文件，模糊信息就只
+    能记为未知，不该让整个流程跑不下去。
+    """
+    logger = logging.getLogger("format_dataset")
+    scores_path = input_dir / BLUR_SCORES_FILENAME
+    if not scores_path.is_file():
+        logger.info(
+            "未找到 %s，帧清单里的 blur_score 将为空（上游是旧版 clean_video.py？）",
+            scores_path,
+        )
+        return {}
+
+    result: Dict[str, Dict[int, float]] = defaultdict(dict)
+    try:
+        text = scores_path.read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("%s 读取失败，忽略", scores_path)
+        return {}
+
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            score = row["blur_score"]
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                raise ValueError("blur_score 不是数字")
+            result[str(row["video"])][int(row["source_frame"])] = float(score)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("跳过 %s 第 %d 行（%s）", scores_path, lineno, exc)
+
+    logger.info(
+        "已读取 %s（%d 个视频、%d 帧的模糊分数）",
+        scores_path,
+        len(result),
+        sum(len(v) for v in result.values()),
+    )
+    return result
+
+
+def is_blurry(score: float, threshold: float) -> bool:
+    """分数低于阈值判为模糊（严格小于：等于阈值算清晰）。
+
+    口径必须和 clean_video.is_frame_blurry()、calibrate_blur.filter_rate() 一致。
+    三处各留一份是有意的 —— 本模块刻意只依赖标准库，不能 import clean_video
+    （会连带拉起 cv2 和 tqdm）。
+    """
+    return score < threshold
+
+
 def infer_frame_step(frames: List[FrameEntry]) -> Optional[int]:
     """从原始帧号的间隔反推抽帧步长。
 
-    clean_video.py 按固定步长采样，相邻保留帧的帧号差必是步长的整数倍。被丢的
-    模糊帧只会把差值抬成倍数，所以对全部差值取 gcd 就能还原步长。
+    上游按固定步长采样，相邻帧的帧号差必是步长的整数倍。帧号若有缺口（稀疏目录、
+    手工裁剪的素材），缺口只会把差值抬成倍数，所以对全部差值取 gcd 就能还原步长。
     """
     if len(frames) < 2:
         return None
@@ -256,7 +322,7 @@ def resolve_episode_fps(
 
     logger.warning(
         "%s：既无 %s 记录、也无法从帧号反推帧率（只有 %d 帧），"
-        "将使用名义时间戳 frame_index/%d —— 该时间轴忽略了被丢弃的模糊帧，会偏小",
+        "将使用名义时间戳 frame_index/%d —— 该时间轴按保留帧数计，帧号有缺口时会偏小",
         episode.source_video,
         IMAGES_META_FILENAME,
         len(episode.frames),
@@ -265,16 +331,40 @@ def resolve_episode_fps(
     return None, FPS_ORIGIN_NOMINAL
 
 
-def scan_input(input_dir: Path, counters: Counters) -> List[EpisodePlan]:
-    """扫描输入目录，按视频名前缀分组。"""
+def split_segments(frames: List[FrameEntry], max_frames: int) -> List[List[FrameEntry]]:
+    """把一段帧按固定长度切成多段；max_frames <= 0 表示不切。
+
+    切分不是为了绕开某个技术限制（视频存储下没有单 episode 的大小上限），
+    而是为了训练时的样本独立性：episode 越长，一个 batch 里来自同一段连续
+    视频的样本越多，时间上越相关。生态里常见的 episode 是几秒到几十秒。
+    """
+    if max_frames <= 0 or len(frames) <= max_frames:
+        return [frames]
+    return [frames[i : i + max_frames] for i in range(0, len(frames), max_frames)]
+
+
+def scan_input(
+    input_dir: Path,
+    counters: Counters,
+    blur_scores: Optional[Dict[str, Dict[int, float]]] = None,
+    blur_threshold: float = 0.0,
+    max_frames_per_episode: int = 0,
+) -> List[EpisodePlan]:
+    """扫描输入目录，按视频名前缀分组，必要时把长视频切成多个 episode。
+
+    blur_scores 来自 _scores.jsonl；缺失时每帧的分数记为 None。
+    """
     logger = logging.getLogger("format_dataset")
     grouped: Dict[str, Dict[int, Tuple[Path, int, int]]] = defaultdict(dict)
+    scores = blur_scores or {}
 
     for path in sorted(input_dir.iterdir()):
         if not path.is_file():
             continue
-        if path.name == IMAGES_META_FILENAME:
-            continue  # 由 load_images_meta 单独读取，不是帧图片
+        if path.name.startswith(METADATA_PREFIX):
+            # _meta.json / _scores.jsonl 等下划线开头的是上游元数据，不是帧图片。
+            # 不跳过的话它们会被当成「文件名不符规范」而误报 warning。
+            continue
 
         parsed = parse_frame_name(path)
         if parsed is None:
@@ -313,12 +403,35 @@ def scan_input(input_dir: Path, counters: Counters) -> List[EpisodePlan]:
 
     # 视频名自然序；组内按原始帧号整数序（不是字符串序）
     plans: List[EpisodePlan] = []
-    for episode_index, video_name in enumerate(sorted(grouped, key=natural_key)):
-        frames = [
-            FrameEntry(src=path, source_frame=frame_no, width=width, height=height)
-            for frame_no, (path, width, height) in sorted(grouped[video_name].items())
-        ]
-        plans.append(EpisodePlan(episode_index=episode_index, source_video=video_name, frames=frames))
+    episode_index = 0
+    for video_name in sorted(grouped, key=natural_key):
+        video_scores = scores.get(video_name, {})
+        frames: List[FrameEntry] = []
+        for frame_no, (path, width, height) in sorted(grouped[video_name].items()):
+            score = video_scores.get(frame_no)
+            frames.append(
+                FrameEntry(
+                    src=path,
+                    source_frame=frame_no,
+                    width=width,
+                    height=height,
+                    blur_score=score,
+                    is_blurry=None if score is None else is_blurry(score, blur_threshold),
+                )
+            )
+
+        segments = split_segments(frames, max_frames_per_episode)
+        for segment_index, segment in enumerate(segments):
+            plans.append(
+                EpisodePlan(
+                    episode_index=episode_index,
+                    source_video=video_name,
+                    frames=segment,
+                    segment_index=segment_index,
+                    segment_count=len(segments),
+                )
+            )
+            episode_index += 1
     return plans
 
 
@@ -421,11 +534,11 @@ def build_info_json(
 
     origins = {episode.source_fps_origin for episode in episodes}
     if origins == {FPS_ORIGIN_RECORDED}:
-        timestamp_source = "source_frame / orig_fps（精确，含模糊帧造成的空洞）"
+        timestamp_source = "source_frame / orig_fps（精确）"
     elif FPS_ORIGIN_NOMINAL in origins:
         timestamp_source = (
             "frame_index / fps（部分视频未获得原始帧率，走名义值；"
-            "该部分时间轴忽略模糊帧空洞，会偏小）"
+            "该部分按保留帧数计时，帧号有缺口时会偏小）"
         )
     else:
         timestamp_source = (
@@ -477,6 +590,10 @@ def build_info_json(
             "episode_index": {"dtype": "int64", "shape": [1], "names": None},
             "index": {"dtype": "int64", "shape": [1], "names": None},
             "task_index": {"dtype": "int64", "shape": [1], "names": None},
+            # 本项目扩展（上游没有）。blur_score 由 clean_video.py 算出，
+            # is_blurry 是按 --blur-threshold 标记的结论；帧本身完整保留。
+            "blur_score": {"dtype": "float32", "shape": [1], "names": None},
+            "is_blurry": {"dtype": "bool", "shape": [1], "names": None},
         },
         "extras": {
             "note": (
@@ -495,6 +612,8 @@ def build_info_json(
             "observed_frame_step_by_video": {
                 episode.source_video: episode.observed_step for episode in episodes
             },
+            "blur_score_threshold": args.blur_threshold,
+            "max_episode_seconds": args.max_episode_seconds,
             "timestamp_source": timestamp_source,
             "sources": sources,
         },
@@ -517,7 +636,9 @@ def build_readme(
         )
     rows = "\n".join(lines)
     timestamp_note = (
-        "对每个 episode 独立计算：`source_frame / 该视频的原始帧率`。\n\n"
+        "对每个 episode 独立计算：`(source_frame - 本段首帧) / 该视频的原始帧率`，"
+        "即**相对本段起点**的秒数（lerobot 写的就是 `frame_index / fps`，两者一致）。"
+        "跨段的绝对位置看 `source_frame`。\n\n"
         "| source_video | 原始帧率 | 观测步长 | 帧率来源 | 帧数 |\n"
         "|---|---|---|---|---|\n"
         f"{rows}\n\n"
@@ -526,7 +647,7 @@ def build_readme(
         f"- `{FPS_ORIGIN_INFERRED}`：从帧号间隔反推的近似值，误差约 ±{args.fps / 2:g} fps"
         f"（步长 × {args.fps}）；要精确值请重跑 `clean_video.py` 生成 `{IMAGES_META_FILENAME}`\n"
         f"- `{FPS_ORIGIN_NOMINAL}`：**该 episode 没有可用的原始帧率**，"
-        f"退回 `frame_index / {args.fps}`。该时间轴忽略模糊帧造成的空洞，会系统性偏小\n"
+        f"退回 `frame_index / {args.fps}`。该时间轴按保留帧数计时，帧号有缺口时会系统性偏小\n"
     )
     return f"""# 数据集说明（仿 LeRobot v2.0）
 
@@ -553,12 +674,22 @@ LeRobot 是**模仿学习**数据集，核心是 `(observation, action)` 配对�
 
 ## 时序说明
 
-`clean_video.py` 抽帧时丢弃了模糊帧，所以帧序列存在**时序空洞**。
+`clean_video.py` 保存**全部**采样帧，不丢弃任何帧 —— 帧因此落在 `1/fps` 的均匀网格上，
+下游的时序查询（如 lerobot 的 `delta_timestamps`）才成立。帧号通常是连续的。
+
 文件名已按 episode 内位置重命名为 `frame_000000.jpg`，
 原始帧号保存在 `meta/frames.jsonl` 的 `source_frame` 字段中。
 
+一个源视频**可能对应多个 episode**：`--max-episode-seconds`（本次
+{args.max_episode_seconds:g} 秒）会把超长的视频切成等长的小段，每段是一个 episode。
+切分不是技术限制，而是为了训练时的样本独立性 —— episode 越长，一个 batch 里来自
+同一段连续视频的样本越多，时间上越相关。切分点记在 `meta/episodes.jsonl` 的
+`segment_index` / `segment_count`。
+
 - `frame_index`：episode 内的顺序位置（0, 1, 2, ... 连续）
-- `source_frame`：原始视频中的帧号（**不连续**，跳过的就是被判定为模糊的帧）
+- `source_frame`：原始视频中的帧号（跨 episode 唯一，切分不会让它重置）
+- `blur_score`：该帧的 Laplacian 方差，由 `clean_video.py` 算出
+- `is_blurry`：按本次 `--blur-threshold {args.blur_threshold:g}` 标记的结论
 - `timestamp`：{timestamp_note}
 
 ## 文件落盘方式
@@ -609,6 +740,31 @@ def report_plan(episodes: List[EpisodePlan], counters: Counters, logger: logging
     return total
 
 
+def report_blur(
+    episodes: List[EpisodePlan], threshold: float, logger: logging.Logger
+) -> None:
+    """报告按阈值会被标为模糊的帧数。只报告，不删任何帧。"""
+    logger.info("=== 模糊标记（阈值 %.1f，只标记不删帧）===", threshold)
+    logger.info("%-14s %9s %9s %9s", "source_video", "frames", "blurry", "rate")
+    total = blurry_total = unknown_total = 0
+    for episode in episodes:
+        frames = len(episode.frames)
+        blurry = sum(1 for f in episode.frames if f.is_blurry)
+        unknown_total += sum(1 for f in episode.frames if f.blur_score is None)
+        total += frames
+        blurry_total += blurry
+        rate = f"{blurry / frames * 100:.1f}%" if frames else "-"
+        logger.info("%-14s %9d %9d %9s", episode.source_video, frames, blurry, rate)
+
+    if total:
+        logger.info("合计：%d 帧中 %d 帧标为模糊（%.1f%%）", total, blurry_total, blurry_total / total * 100)
+    if unknown_total:
+        logger.warning(
+            "另有 %d 帧没有模糊分数（缺 _scores.jsonl 或无对应记录），其 is_blurry 为 null",
+            unknown_total,
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="把抽取出的图片整理成仿 LeRobot v2.0 布局的数据集骨架（仅用标准库）。"
@@ -626,6 +782,18 @@ def parse_args() -> argparse.Namespace:
         help="文件落盘方式，auto = 硬链接 -> 软链接 -> 复制 依次降级（默认 auto）",
     )
     parser.add_argument("--chunks-size", type=int, default=1000, help="每个 chunk 容纳的 episode 数（默认 1000）")
+    parser.add_argument(
+        "--blur-threshold",
+        type=float,
+        default=100.0,
+        help="Laplacian 方差低于此值的帧在清单里标为模糊。只做标记，不删除任何帧（默认 100）",
+    )
+    parser.add_argument(
+        "--max-episode-seconds",
+        type=float,
+        default=60.0,
+        help="单个 episode 的时长上限（秒）；超长的视频按此切成多段，0 表示不切（默认 60）",
+    )
     parser.add_argument("--force", action="store_true", help="输出目录已存在数据集时覆盖，并覆盖同名目标文件")
     parser.add_argument("--dry-run", action="store_true", help="只扫描并打印报告，不创建任何文件")
     return parser.parse_args()
@@ -675,8 +843,26 @@ def main() -> int:
             args.fps,
         )
 
+    blur_scores = load_blur_scores(input_dir)
+
     try:
-        episodes = scan_input(input_dir, counters)
+        max_frames = int(round(args.max_episode_seconds * args.fps))
+    except (TypeError, ValueError):
+        max_frames = 0
+    if args.max_episode_seconds <= 0 or max_frames <= 0:
+        max_frames = 0
+        logger.info("--max-episode-seconds 为 0：长视频不切分，一个视频就是一个 episode")
+    else:
+        logger.info(
+            "--max-episode-seconds %.1f：每 %d 帧切一段（%.1f 秒 @ %d fps）",
+            args.max_episode_seconds,
+            max_frames,
+            max_frames / args.fps,
+            args.fps,
+        )
+
+    try:
+        episodes = scan_input(input_dir, counters, blur_scores, args.blur_threshold, max_frames)
     except OSError:
         logger.exception("扫描输入目录失败：%s", input_dir)
         return 1
@@ -716,6 +902,8 @@ def main() -> int:
             "注意：各视频的抽帧步长不同（%s），说明这批素材原始帧率不统一",
             ", ".join(str(s) for s in sorted(distinct_steps)),
         )
+
+    report_blur(episodes, args.blur_threshold, logger)
 
     if args.dry_run:
         logger.info("--dry-run：未创建任何文件，耗时 %.2fs", time.time() - start_ts)
@@ -773,11 +961,15 @@ def main() -> int:
         # 一旦 --output 传的是绝对路径，写进 jsonl 的就会是本机绝对路径，数据集不可移植。
         frame_dir_rel = frame_dir.relative_to(output_dir).as_posix()
         kept = 0
+        # timestamp 相对本段起点计时，而不是视频起点：一个视频可能被切成多段，
+        # 每段的 timestamp 都从 0 开始 —— lerobot 写的就是 frame_index / fps，
+        # 两者必须一致。跨段的绝对位置由 source_frame 承载。
+        segment_start = episode.frames[0].source_frame
         for position, entry in enumerate(episode.frames):
             dims[(entry.width, entry.height)] += 1
 
             if episode.source_fps:
-                timestamp = round(entry.source_frame / episode.source_fps, 6)
+                timestamp = round((entry.source_frame - segment_start) / episode.source_fps, 6)
             else:
                 timestamp = round(position / args.fps, 6)
 
@@ -792,6 +984,10 @@ def main() -> int:
                     "episode_index": episode.episode_index,
                     "frame_index": position,
                     "source_frame": entry.source_frame,
+                    # 模糊分数是上游算好的原始值；is_blurry 是按本次 --blur-threshold
+                    # 标记的结论。帧本身完整保留，下游按需筛选。
+                    "blur_score": entry.blur_score,
+                    "is_blurry": entry.is_blurry,
                     "timestamp": timestamp,
                     "path": f"{frame_dir_rel}/frame_{position:06d}.jpg",
                 }
@@ -819,6 +1015,9 @@ def main() -> int:
                 "source_fps_origin": episode.source_fps_origin,
                 "first_source_frame": episode.frames[0].source_frame,
                 "last_source_frame": episode.frames[-1].source_frame,
+                # 同一视频被切成多段时，这两项说明这是第几段、共几段
+                "segment_index": episode.segment_index,
+                "segment_count": episode.segment_count,
             }
         )
         logger.info(

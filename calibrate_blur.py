@@ -1,38 +1,39 @@
 #!/usr/bin/env python
-"""为 clean_video.py 的模糊阈值标定提供依据。
+"""为 format_dataset.py 的模糊阈值标定提供依据。
 
 这是管线之外的辅助工具，不产出数据集。它回答三个问题：
 
 1. 素材的 Laplacian 方差分布长什么样（分位数 + 直方图）
-2. 给定的阈值会拦掉多少帧
-3. 被拦掉的究竟是真模糊还是误杀 —— 导出复核帧供肉眼判断
+2. 给定的阈值会把多少帧标为模糊
+3. 越线的究竟是真模糊还是误杀 —— 导出复核帧供肉眼判断
 
 **不自动推荐阈值**：Laplacian 方差分布通常不是双峰的，任何自动选阈值的做法
 都是在假装有依据。工具只提供事实，线画在哪由人决定 —— 这也是要导出复核帧的原因。
 
-分数由 clean_video.blur_score 计算，与过滤时用的是同一个函数；采样帧号也与
-clean_video 一致。两者不一致的话，统计出的分布就对不上实际过滤行为。
+输入是 clean_video.py 的产物目录（`output/images`），**不重新解码视频**：每帧的分数
+第一步已经算好并存进 `_scores.jsonl` 了，这里只是把它读出来重新统计。因此本模块
+不需要 cv2，与 format_dataset.py 一样是纯标准库。
+
+早先的版本会自己解码视频来算分，那时「采样规则必须与 clean_video 一致」是靠两处
+代码写同一套逻辑维持的约定。现在读的是同一份数据，一致性是事实而不是约定。
 """
 
 import argparse
 import json
 import logging
-import math
+import shutil
+import statistics
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import cv2
+# 第一步写在这两个文件里；本工具只读它们，不碰视频
+BLUR_SCORES_FILENAME = "_scores.jsonl"
+IMAGES_META_FILENAME = "_meta.json"
 
-from clean_video import blur_score, list_videos, video_output_prefix
-
-# 默认全量分析。抽样（--sample）只在素材大到全量解码吃不消时才值得用：
-# 实测 1080p 长 GOP 视频，跳转读一帧约 59ms，顺序解码一帧约 28ms（且只在候选帧
-# 上算分）。跳转能省的总时间有限，却会丢掉大量帧，反而让分位数不准。
-DEFAULT_SAMPLE = 0
 DEFAULT_THRESHOLD = 100.0
 DEFAULT_BAND = 3.0
 DEFAULT_EXPORT_MAX = 150
@@ -46,16 +47,17 @@ HIST_BUCKETS = (0.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, float("inf"))
 
 @dataclass
 class VideoScores:
-    """一个视频的采样结果。"""
+    """一个视频（第一步的输出名前缀）的分数。
 
-    path: Path
-    name: str                # 与 clean_video.py 的 _meta.json 键一致，便于对照
-    orig_fps: float
-    frame_step: int
-    candidates: int          # 符合采样条件的帧总数（抽样前）
-    frame_indices: List[int]
-    scores: List[float]
-    elapsed: float
+    字段比解码版少：分数是现成的，没有「解码耗时」「候选帧数」这类过程量。
+    """
+
+    name: str                                    # 与 clean_video.py 的 _meta.json 键一致
+    frame_indices: List[int] = field(default_factory=list)
+    scores: List[float] = field(default_factory=list)
+    # 下面两项只为在报告里显示，来自 _meta.json；缺失时为 None
+    orig_fps: Optional[float] = None
+    frame_step: Optional[int] = None
 
 
 def evenly_spaced(items: Sequence, limit: int) -> List:
@@ -70,97 +72,78 @@ def evenly_spaced(items: Sequence, limit: int) -> List:
     return sorted({items[round(i * step)] for i in range(limit)})
 
 
-def score_video(
-    video_path: Path, input_dir: Path, target_fps: int, sample: int
-) -> Optional[VideoScores]:
-    """采样帧并算出每帧的 Laplacian 方差。
+def load_scores(images_dir: Path) -> List[VideoScores]:
+    """读 clean_video.py 写的 _scores.jsonl，按视频分组后按帧号排序。"""
+    logger = logging.getLogger("calibrate_blur")
+    scores_path = images_dir / BLUR_SCORES_FILENAME
+    if not scores_path.is_file():
+        raise FileNotFoundError(
+            f"找不到 {scores_path}。本工具分析的是第一步的产物，"
+            "请先跑 clean_video.py --input <视频目录> --output <输出目录>"
+        )
 
-    采样帧号与 clean_video.py 完全一致（`read_idx % frame_step == 0`）。抽样时用
-    跳转读取而非全量解码 —— 已实测两者结果逐位相同，且跳转快得多。
-    """
-    started = time.time()
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        return None
+    grouped: Dict[str, Dict[int, float]] = defaultdict(dict)
+    for lineno, line in enumerate(scores_path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            grouped[str(row["video"])][int(row["source_frame"])] = float(row["blur_score"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            logger.warning("跳过 %s 第 %d 行（%s）", scores_path, lineno, exc)
 
-    try:
-        orig_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if total_frames <= 0:
-            return None
+    if not grouped:
+        raise ValueError(f"{scores_path} 里没有任何可用的分数")
 
-        if orig_fps <= 0 or target_fps <= 0:
-            frame_step = 1
-        else:
-            frame_step = max(1, int(round(orig_fps / float(target_fps))))
+    # _meta.json 只为在报告里显示原始帧率，读不到不影响分析
+    meta_by_video = {}
+    meta_path = images_dir / IMAGES_META_FILENAME
+    if meta_path.is_file():
+        try:
+            videos = json.loads(meta_path.read_text(encoding="utf-8")).get("videos")
+            if isinstance(videos, dict):
+                meta_by_video = videos
+        except (OSError, json.JSONDecodeError, AttributeError):
+            logger.warning("%s 无法解析，报告里不显示原始帧率", meta_path)
 
-        candidates = list(range(0, total_frames, frame_step))
-        chosen = evenly_spaced(candidates, sample)
+    results: List[VideoScores] = []
+    for name in sorted(grouped):
+        frame_scores = sorted(grouped[name].items())
+        meta = meta_by_video.get(name) if isinstance(meta_by_video.get(name), dict) else {}
+        results.append(
+            VideoScores(
+                name=name,
+                frame_indices=[frame for frame, _ in frame_scores],
+                scores=[score for _, score in frame_scores],
+                orig_fps=meta.get("orig_fps"),
+                frame_step=meta.get("frame_step"),
+            )
+        )
 
-        indices: List[int] = []
-        scores: List[float] = []
-        if len(chosen) == len(candidates):
-            # 本来就要全部，顺序解码比逐个跳转快
-            read_idx = 0
-            wanted = set(chosen)
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                if read_idx in wanted:
-                    indices.append(read_idx)
-                    scores.append(blur_score(frame))
-                read_idx += 1
-        else:
-            for idx in chosen:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                ok, frame = cap.read()
-                if not ok:
-                    continue
-                indices.append(idx)
-                scores.append(blur_score(frame))
-    finally:
-        cap.release()
-
-    return VideoScores(
-        path=video_path,
-        name=video_output_prefix(video_path, input_dir),
-        orig_fps=orig_fps,
-        frame_step=frame_step,
-        candidates=len(candidates),
-        frame_indices=indices,
-        scores=scores,
-        elapsed=time.time() - started,
+    logger.info(
+        "已读取 %s：%d 个视频、%d 帧（第一步算好的分数，不重新解码）",
+        scores_path,
+        len(results),
+        sum(len(r.scores) for r in results),
     )
-
-
-def score_video_worker(
-    video_path_str: str, input_dir_str: str, target_fps: int, sample: int
-) -> Optional[VideoScores]:
-    """可被进程池调用的包装（top-level）。"""
-    return score_video(Path(video_path_str), Path(input_dir_str), target_fps, sample)
+    return results
 
 
 def percentiles(
     scores: Sequence[float], points: Sequence[float] = PERCENTILES
 ) -> List[Tuple[float, float]]:
-    """百分位分位数，线性插值。"""
+    """百分位（线性插值）。空列表返回空。"""
     if not scores:
         return []
     ordered = sorted(scores)
-    result = []
+    last = len(ordered) - 1
+    result: List[Tuple[float, float]] = []
     for point in points:
-        if point <= 0:
-            value = ordered[0]
-        elif point >= 100:
-            value = ordered[-1]
-        else:
-            position = (len(ordered) - 1) * point / 100.0
-            low, high = math.floor(position), math.ceil(position)
-            if low == high:
-                value = ordered[low]
-            else:
-                value = ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+        position = point / 100.0 * last
+        low = int(position)
+        high = min(low + 1, last)
+        weight = position - low
+        value = ordered[low] * (1 - weight) + ordered[high] * weight
         result.append((point, value))
     return result
 
@@ -168,36 +151,40 @@ def percentiles(
 def histogram(
     scores: Sequence[float], buckets: Sequence[float] = HIST_BUCKETS
 ) -> List[Tuple[str, int]]:
-    """按固定边界分桶计数，返回 [(区间标签, 数量), ...]。"""
+    """按 buckets 分桶计数。桶边界归上一桶（左闭右开）。"""
     counts = [0] * (len(buckets) - 1)
     for score in scores:
-        for i in range(len(buckets) - 1):
-            if buckets[i] <= score < buckets[i + 1]:
-                counts[i] += 1
+        for index in range(len(buckets) - 1):
+            if buckets[index] <= score < buckets[index + 1]:
+                counts[index] += 1
                 break
-    return [
-        (f"{buckets[i]:g}-{buckets[i + 1]:g}", counts[i]) for i in range(len(counts))
+        else:
+            counts[-1] += 1     # 理论上到不了：最后一桶上界是 inf
+    labels = [
+        f"{buckets[i]:g}-{buckets[i + 1]:g}" if buckets[i + 1] != float("inf")
+        else f"{buckets[i]:g}+"
+        for i in range(len(buckets) - 1)
     ]
+    return list(zip(labels, counts))
 
 
 def filter_rate(scores: Sequence[float], threshold: float) -> float:
-    """该阈值下会被判为模糊的比例。"""
+    """低于阈值的比例（严格小于：等于阈值算清晰）。
+
+    口径与 format_dataset.is_blurry()、clean_video.is_frame_blurry() 一致。
+    """
     if not scores:
         return 0.0
     return sum(1 for s in scores if s < threshold) / len(scores)
 
 
 def print_distribution(result: VideoScores, logger: logging.Logger) -> None:
-    logger.info(
-        "--- %s：%d 帧，%.2f fps，步长 %d，采样 %d / %d 帧（%.1fs）---",
-        result.name,
-        result.candidates * result.frame_step,
-        result.orig_fps,
-        result.frame_step,
-        len(result.scores),
-        result.candidates,
-        result.elapsed,
-    )
+    if result.orig_fps and result.frame_step:
+        origin = f"{result.orig_fps:g} fps，步长 {result.frame_step}"
+    else:
+        origin = "原始帧率未知"
+    logger.info("--- %s：%d 帧（%s）---", result.name, len(result.scores), origin)
+
     points = percentiles(result.scores)
     logger.info("  " + "  ".join(f"p{int(p)}={v:g}" for p, v in points))
 
@@ -213,31 +200,27 @@ def print_threshold_table(
 ) -> None:
     header = f"{'阈值':>10}" + "".join(f"{r.name:>12}" for r in results) + f"{'合计':>12}"
     logger.info(header)
+    all_scores = [s for r in results for s in r.scores]
     for threshold in thresholds:
         row = f"{threshold:>10g}"
-        total_below = 0
-        total = 0
         for result in results:
-            below = sum(1 for s in result.scores if s < threshold)
-            total_below += below
-            total += len(result.scores)
-            rate = below / len(result.scores) * 100 if result.scores else 0.0
-            row += f"{rate:>11.1f}%"
-        overall = total_below / total * 100 if total else 0.0
-        logger.info(row + f"{overall:>11.1f}%")
+            row += f"{filter_rate(result.scores, threshold) * 100:>11.1f}%"
+        logger.info(row + f"{filter_rate(all_scores, threshold) * 100:>11.1f}%")
 
 
 def export_review_frames(
     result: VideoScores,
+    images_dir: Path,
     below_dir: Path,
     critical_dir: Path,
     threshold: float,
     band: float,
     export_max: int,
 ) -> Tuple[int, int, int, int]:
-    """把复核帧存出来，返回 (below 写出, critical 写出, below 总数, critical 总数)。
+    """把复核帧拷出来，返回 (below 写出, critical 写出, below 总数, critical 总数)。
 
     总数与实际写出数分开返回：截取后屏幕上要能看出「符合条件的有多少、导出了多少」。
+    帧是从第一步的产物目录**拷贝**的，不再解码视频。
 
     文件名以分数开头（`var0000183.4_1_frame000123.jpg`），按名称排序即按质量排序，
     翻一遍就能看出线该画在哪。
@@ -269,27 +252,26 @@ def export_review_frames(
     below_dir.mkdir(parents=True, exist_ok=True)
     critical_dir.mkdir(parents=True, exist_ok=True)
 
+    logger = logging.getLogger("calibrate_blur")
     counts = {"below": 0, "critical": 0}
-    cap = cv2.VideoCapture(str(result.path))
-    if not cap.isOpened():
-        return 0, 0
-    try:
-        for kind, group in (("below", below), ("critical", critical)):
-            for index, score in group:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-                ok, frame = cap.read()
-                if not ok:
-                    continue
-                target = below_dir if kind == "below" else critical_dir
-                # 定宽是排序正确的前提：文件名按字典序排 = 按分数排。两位小数是为了
-                # 让阈值两侧不至于都显示成 100.0（实际 99.96 会被 .1f 显示成 100.0，
-                # 看起来像阈值没生效）。分数超过 5 位整数时定宽失效，但 Laplacian
-                # 方差不会到那个量级。
-                name = f"var{score:09.2f}_{result.name}_frame{index:06d}.jpg"
-                if cv2.imwrite(str(target / name), frame):
-                    counts[kind] += 1
-    finally:
-        cap.release()
+    for kind, group in (("below", below), ("critical", critical)):
+        target = below_dir if kind == "below" else critical_dir
+        for index, score in group:
+            source = images_dir / f"{result.name}_frame_{index:06d}.jpg"
+            if not source.is_file():
+                logger.warning("帧文件不存在，跳过：%s", source)
+                continue
+            # 定宽是排序正确的前提：文件名按字典序排 = 按分数排。两位小数是为了
+            # 让阈值两侧不至于都显示成 100.0（实际 99.96 会被 .1f 显示成 100.0，
+            # 看起来像阈值没生效）。分数超过 5 位整数时定宽失效，但 Laplacian
+            # 方差不会到那个量级。
+            name = f"var{score:09.2f}_{result.name}_frame{index:06d}.jpg"
+            try:
+                shutil.copy2(source, target / name)
+            except OSError:
+                logger.exception("拷贝失败：%s", source)
+                continue
+            counts[kind] += 1
     return counts["below"], counts["critical"], total_below, total_critical
 
 
@@ -318,20 +300,14 @@ def write_scores_jsonl(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="为 clean_video.py 的模糊阈值标定提供依据（分位数、直方图、阈值影响、复核帧）。"
-    )
-    parser.add_argument("--input", "-i", required=True, help="视频目录，递归扫描 .mp4")
-    parser.add_argument(
-        "--fps", type=int, default=5, help="采样帧率，应与 clean_video.py 一致（默认 5）"
+        description="为 format_dataset.py 的模糊阈值标定提供依据"
+        "（分位数、直方图、阈值影响、复核帧）。"
     )
     parser.add_argument(
-        "--sample",
-        type=int,
-        default=DEFAULT_SAMPLE,
-        help=(
-            "每个视频最多分析多少帧，均匀跨度取；0 = 全量（默认）。"
-            "仅当素材大到全量解码吃不消时才设，抽样会让分位数变粗"
-        ),
+        "--input",
+        "-i",
+        default="output/images",
+        help="clean_video.py 的产物目录，即含 _scores.jsonl 的图片目录（默认 output/images）",
     )
     parser.add_argument(
         "--threshold",
@@ -356,9 +332,6 @@ def parse_args() -> argparse.Namespace:
             f"（默认 {DEFAULT_EXPORT_MAX}）。临界带可能覆盖大半个视频，不截取会翻不完"
         ),
     )
-    parser.add_argument(
-        "--workers", type=int, default=None, help="并行进程数（默认 CPU 核数）"
-    )
     return parser.parse_args()
 
 
@@ -373,15 +346,9 @@ def main() -> int:
     args = parse_args()
     logger = logging.getLogger("calibrate_blur")
 
-    input_dir = Path(args.input)
+    images_dir = Path(args.input)
     thresholds = args.threshold if args.threshold else [DEFAULT_THRESHOLD]
 
-    if args.fps <= 0:
-        logger.error("--fps 必须为正整数")
-        return 1
-    if args.sample < 0:
-        logger.error("--sample 不能为负数（0 表示全量）")
-        return 1
     if args.export_band <= 1:
         logger.error("--export-band 必须大于 1（否则 [阈值, 阈值*band] 退化成一个点）")
         return 1
@@ -393,58 +360,26 @@ def main() -> int:
             logger.error("--threshold 必须为正数，收到 %g", threshold)
             return 1
 
-    try:
-        videos = list(list_videos(input_dir))
-    except Exception:
-        logger.exception("扫描视频目录失败：%s", input_dir)
-        return 1
-    if not videos:
-        logger.error("在 %s 中没有找到 mp4 视频", input_dir)
-        return 1
-
-    logger.info(
-        "分析 %d 个视频，采样帧率 %d，每视频最多 %s 帧",
-        len(videos),
-        args.fps,
-        "全量" if args.sample <= 0 else args.sample,
-    )
-
     started = time.time()
-    results: List[VideoScores] = []
-    with ProcessPoolExecutor(max_workers=args.workers) as executor:
-        futures = {
-            executor.submit(
-                score_video_worker, str(video), str(input_dir), args.fps, args.sample
-            ): video
-            for video in videos
-        }
-        for future in as_completed(futures):
-            video = futures[future]
-            try:
-                result = future.result()
-            except Exception:
-                logger.exception("分析失败：%s", video)
-                continue
-            if result is None:
-                logger.warning("无法读取，跳过：%s", video)
-                continue
-            results.append(result)
 
-    if not results:
-        logger.error("没有任何视频被成功分析")
+    try:
+        results = load_scores(images_dir)
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
         return 1
-
-    results.sort(key=lambda r: r.name)
+    except (OSError, ValueError) as exc:
+        logger.error("读取失败：%s", exc)
+        return 1
 
     logger.info("\n=== 方差分布 ===")
     for result in results:
         print_distribution(result, logger)
 
-    logger.info("\n=== 阈值影响（被判为模糊、丢弃的比例）===")
+    logger.info("\n=== 阈值影响（被判为模糊、会被标掉的比例）===")
     print_threshold_table(results, thresholds, logger)
 
     logger.info("\n=== 各视频一致性 ===")
-    medians = [(r.name, percentiles(r.scores)[PERCENTILES.index(50)][1]) for r in results]
+    medians = [(r.name, statistics.median(r.scores)) for r in results if r.scores]
     for name, median in medians:
         logger.info("  %-14s 中位数 %g", name, median)
     if len(medians) > 1:
@@ -452,7 +387,7 @@ def main() -> int:
         if min(values) > 0 and max(values) / min(values) >= 2:
             logger.warning(
                 "各视频的方差中位数相差 %.1f 倍。同一个绝对阈值对它们的严格程度并不一致，"
-                "统一阈值意味着各视频的过滤标准其实不同 —— 可考虑按视频分别定阈值",
+                "统一阈值意味着各视频的标注标准其实不同 —— 可考虑按视频分别定阈值",
                 max(values) / min(values),
             )
 
@@ -465,6 +400,7 @@ def main() -> int:
         for result in results:
             below, critical, all_below, all_critical = export_review_frames(
                 result,
+                images_dir,
                 below_dir,
                 critical_dir,
                 thresholds[0],
@@ -502,7 +438,8 @@ def main() -> int:
 
     logger.info("\n=== 完成（耗时 %.1fs）===", time.time() - started)
     logger.info(
-        "本工具不改任何阈值。定好之后用 clean_video.py --blur_threshold <值> 重新抽帧"
+        "本工具不改任何阈值。定好之后用 format_dataset.py --blur-threshold <值> 重新生成清单"
+        "（帧不会因此被删，只是 frames.jsonl 里的 is_blurry 列换一种填法）"
     )
     return 0
 

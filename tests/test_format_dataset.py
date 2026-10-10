@@ -212,9 +212,78 @@ def test_episode_order_is_natural_not_lexicographic(make_images, run_format, tmp
     assert [e["episode_index"] for e in episodes] == [0, 1]
 
 
+def test_split_segments_cuts_evenly_and_keeps_the_remainder():
+    entries = [fd.FrameEntry(Path(f"{i}.jpg"), i, 8, 8) for i in range(5)]
+    assert [len(s) for s in fd.split_segments(entries, 2)] == [2, 2, 1]
+    assert [e.source_frame for s in fd.split_segments(entries, 2) for e in s] == list(range(5))
+
+
+@pytest.mark.parametrize("limit", [0, -1, 5, 99])
+def test_split_segments_leaves_short_or_unlimited_input_alone(limit):
+    entries = [fd.FrameEntry(Path(f"{i}.jpg"), i, 8, 8) for i in range(5)]
+    assert fd.split_segments(entries, limit) == [entries]
+
+
+def test_long_video_becomes_multiple_episodes(
+    make_images, write_meta, run_format, tmp_path, read_jsonl
+):
+    """长视频按 --max-episode-seconds 切段；切分不能丢帧也不能改 source_frame。"""
+    images = make_images({"1": [0, 6, 12, 18, 24]})
+    write_meta(images, {"1": 30.0})
+    # fps=5 时 0.4 秒 = 2 帧
+    rc, out = build(images, tmp_path / "ds", run_format, "--max-episode-seconds", "0.4")
+    assert rc == 0
+
+    episodes = read_jsonl(out / "meta" / "episodes.jsonl")
+    assert [e["length"] for e in episodes] == [2, 2, 1]
+    assert [e["segment_index"] for e in episodes] == [0, 1, 2]
+    assert all(e["segment_count"] == 3 for e in episodes)
+    assert all(e["source_video"] == "1" for e in episodes)
+    # 每段的帧号区间在原视频里是连续的、不重叠的、合起来就是全部
+    assert [e["first_source_frame"] for e in episodes] == [0, 12, 24]
+    assert [e["last_source_frame"] for e in episodes] == [6, 18, 24]
+
+    frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert [f["source_frame"] for f in frames] == [0, 6, 12, 18, 24]   # 一帧不少
+    assert [f["episode_index"] for f in frames] == [0, 0, 1, 1, 2]
+    assert [f["frame_index"] for f in frames] == [0, 1, 0, 1, 0]       # 段内从 0 起
+
+
+def test_timestamp_restarts_at_each_segment(
+    make_images, write_meta, run_format, tmp_path, read_jsonl
+):
+    """timestamp 相对本段起点 —— lerobot 写的是 frame_index/fps，两者必须一致。"""
+    images = make_images({"1": [0, 6, 12, 18]})
+    write_meta(images, {"1": 30.0})
+    rc, out = build(images, tmp_path / "ds", run_format, "--max-episode-seconds", "0.4")
+    assert rc == 0
+
+    frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert [f["timestamp"] for f in frames] == [0.0, 0.2, 0.0, 0.2]
+
+
+def test_zero_max_episode_seconds_keeps_one_episode_per_video(
+    make_images, write_meta, run_format, tmp_path, read_jsonl, caplog
+):
+    images = make_images({"1": [0, 6, 12, 18, 24]})
+    write_meta(images, {"1": 30.0})
+    with caplog.at_level(logging.INFO):
+        rc, out = build(images, tmp_path / "ds", run_format, "--max-episode-seconds", "0")
+    assert rc == 0
+    assert "不切分" in caplog.text
+
+    episodes = read_jsonl(out / "meta" / "episodes.jsonl")
+    assert len(episodes) == 1
+    assert episodes[0]["length"] == 5
+    assert episodes[0]["segment_index"] == 0 and episodes[0]["segment_count"] == 1
+
+
 def test_frames_keep_source_numbering_and_gaps(make_images, write_meta, run_format, tmp_path, read_jsonl):
-    """核心设计：帧文件按位置连续编号，原始帧号与空洞记在 jsonl 里。"""
-    images = make_images({"1": [0, 6, 12, 24]})   # 帧 18 被当成模糊帧丢掉了
+    """核心设计：帧文件按位置连续编号，原始帧号与缺口记在 jsonl 里。
+
+    正常产物不会有缺口（第一步不丢帧了），这里手写稀疏帧号，覆盖容错路径。
+    """
+    images = make_images({"1": [0, 6, 12, 24]})   # 帧 18 缺号
     write_meta(images, {"1": 30.0})
     rc, out = build(images, tmp_path / "ds", run_format)
     assert rc == 0
@@ -223,8 +292,11 @@ def test_frames_keep_source_numbering_and_gaps(make_images, write_meta, run_form
     assert [f["index"] for f in frames] == [0, 1, 2, 3]           # 全局连续
     assert [f["frame_index"] for f in frames] == [0, 1, 2, 3]     # episode 内连续
     assert [f["source_frame"] for f in frames] == [0, 6, 12, 24]  # 原始帧号保留
-    # 30fps 下 0.6s 那一帧没了，时间戳必须在 0.4 直接跳到 0.8
+    # 30fps 下 0.6s 那一帧没有，时间戳必须在 0.4 直接跳到 0.8
     assert [f["timestamp"] for f in frames] == [0.0, 0.2, 0.4, 0.8]
+    # 没有 _scores.jsonl，模糊字段记录为未知而不是伪造一个值
+    assert [f["blur_score"] for f in frames] == [None] * 4
+    assert [f["is_blurry"] for f in frames] == [None] * 4
 
 
 def test_frames_on_disk_follow_positional_naming(make_images, run_format, tmp_path, read_jsonl):
@@ -237,6 +309,81 @@ def test_frames_on_disk_follow_positional_naming(make_images, run_format, tmp_pa
         path = out / row["path"]
         assert path.is_file()
         assert path.name == f"frame_{row['frame_index']:06d}.jpg"
+
+
+def test_blur_scores_carry_into_frames_jsonl(
+    make_images, write_meta, write_scores, run_format, tmp_path, read_jsonl
+):
+    images = make_images({"1": [0, 6, 12]})
+    write_meta(images, {"1": 30.0})
+    write_scores(images, {"1": {0: 250.0, 6: 42.0, 12: 99.99}})
+
+    rc, out = build(images, tmp_path / "ds", run_format, "--blur-threshold", "100")
+    assert rc == 0
+
+    frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert [f["blur_score"] for f in frames] == [250.0, 42.0, 99.99]
+    # 严格小于：99.99 算模糊，恰好 100 不算
+    assert [f["is_blurry"] for f in frames] == [False, True, True]
+
+
+def test_blur_threshold_marks_but_never_drops(
+    make_images, write_meta, write_scores, run_format, tmp_path, read_jsonl
+):
+    """阈值只改变标记列，绝不能改变帧数 —— 一旦删帧，帧网格就不均匀了。"""
+    images = make_images({"1": [0, 6, 12]})
+    write_meta(images, {"1": 30.0})
+    write_scores(images, {"1": {0: 250.0, 6: 42.0, 12: 99.99}})
+
+    rc_strict, out_strict = build(images, tmp_path / "strict", run_format, "--blur-threshold", "300")
+    rc_loose, out_loose = build(images, tmp_path / "loose", run_format, "--blur-threshold", "10")
+    assert rc_strict == 0 and rc_loose == 0
+
+    strict = read_jsonl(out_strict / "meta" / "frames.jsonl")
+    loose = read_jsonl(out_loose / "meta" / "frames.jsonl")
+
+    assert len(strict) == len(loose) == 3
+    assert [f["source_frame"] for f in strict] == [f["source_frame"] for f in loose]
+    assert [f["is_blurry"] for f in strict] == [True, True, True]    # 阈值 300，全是
+    assert [f["is_blurry"] for f in loose] == [False, False, False]  # 阈值 10，没有
+
+
+def test_info_json_records_the_blur_threshold(
+    make_images, write_meta, run_format, tmp_path
+):
+    images = make_images({"1": [0, 6]})
+    write_meta(images, {"1": 30.0})
+    rc, out = build(images, tmp_path / "ds", run_format, "--blur-threshold", "250")
+    assert rc == 0
+
+    info = read_info(out)
+    assert info["extras"]["blur_score_threshold"] == 250.0
+    assert sorted(info["features"]) == [
+        "blur_score",
+        "episode_index",
+        "frame_index",
+        "index",
+        "is_blurry",
+        "observation.images.front",
+        "task_index",
+        "timestamp",
+    ]
+
+
+def test_missing_scores_are_tolerated_but_warned(
+    make_images, write_meta, run_format, tmp_path, read_jsonl, caplog
+):
+    """没有 _scores.jsonl 时不能崩，但要说清模糊信息是未知的。"""
+    images = make_images({"1": [0, 6]})
+    write_meta(images, {"1": 30.0})   # 只写 _meta.json，不写分数
+
+    with caplog.at_level(logging.INFO):
+        rc, out = build(images, tmp_path / "ds", run_format)
+    assert rc == 0
+
+    frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert [f["blur_score"] for f in frames] == [None, None]
+    assert "没有模糊分数" in caplog.text
 
 
 def test_chunks_size_splits_episodes_across_chunks(make_images, run_format, tmp_path):
@@ -364,13 +511,17 @@ def test_detects_mixed_frame_rates(make_images, run_format, tmp_path, caplog):
     assert "不统一" in caplog.text
 
 
-def test_meta_json_is_not_mistaken_for_a_frame(make_images, write_meta, run_format, tmp_path, caplog):
+def test_metadata_files_are_not_mistaken_for_frames(
+    make_images, write_meta, write_scores, run_format, tmp_path, caplog
+):
     images = make_images({"1": [0, 6]})
     write_meta(images, {"1": 30.0})
+    write_scores(images, {"1": {0: 250.0, 6: 42.0}})
     with caplog.at_level(logging.INFO):     # 汇总行是 INFO 级别
         rc, _ = build(images, tmp_path / "ds", run_format)
     assert rc == 0
-    assert "不匹配 0" in caplog.text       # _meta.json 不该被计入「文件名不符合规范」
+    # _meta.json 与 _scores.jsonl 都不该被计入「文件名不符合规范」
+    assert "不匹配 0" in caplog.text
 
 
 # --------------------------------------------------------------------------

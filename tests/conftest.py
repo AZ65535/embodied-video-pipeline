@@ -39,9 +39,10 @@ def tiny_jpegs(fixtures_dir: Path) -> list:
 def make_images(tmp_path: Path, tiny_jpegs: list):
     """造一个假的 output/images 目录。
 
-    spec 形如 ``{"1": [0, 6, 12], "2": [0, 5]}``，值是该视频保留下来的原始帧号
-    （跳过的号就是被 clean_video.py 判为模糊丢掉的帧）；extra_files 塞干扰文件，
-    mixed_sizes=True 让尺寸交错，用于测 info.json 的「多尺寸」告警路径。
+    spec 形如 ``{"1": [0, 6, 12], "2": [0, 5]}``，值是该视频的原始帧号。正常产物
+    里帧号是连续的（第一步不再丢帧）；手写不连续的号可以测稀疏目录的容错路径。
+    extra_files 塞干扰文件，mixed_sizes=True 让尺寸交错，用于测 info.json 的
+    「多尺寸」告警路径。
     """
     counter = itertools.count()
 
@@ -70,14 +71,36 @@ def write_meta():
 
     def _write(images_dir: Path, fps_by_video: dict, target_fps: int = 5) -> Path:
         payload = {
-            "format": 1,
+            "format": 2,
             "tool": "clean_video.py",
             "target_fps": target_fps,
-            "blur_threshold": 100.0,
             "videos": {name: {"orig_fps": fps} for name, fps in fps_by_video.items()},
         }
         path = Path(images_dir) / format_dataset.IMAGES_META_FILENAME
         path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        return path
+
+    return _write
+
+
+@pytest.fixture
+def write_scores():
+    """直接手写 `_scores.jsonl`（与 write_meta 同理，不经过 clean_video）。
+
+    scores_by_video 形如 ``{"1": {0: 250.0, 6: 42.0}}``。
+    """
+
+    def _write(images_dir: Path, scores_by_video: dict) -> Path:
+        rows = [
+            {"video": name, "source_frame": frame, "blur_score": score}
+            for name, frame_scores in scores_by_video.items()
+            for frame, score in frame_scores.items()
+        ]
+        path = Path(images_dir) / format_dataset.BLUR_SCORES_FILENAME
+        path.write_text(
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+            encoding="utf-8",
+        )
         return path
 
     return _write
