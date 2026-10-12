@@ -40,6 +40,14 @@ SOURCE_FRAME_KEY = "source_frame"
 # 只写原始分数，不写「是否模糊」的布尔量 —— 阈值由下游自己定。
 BLUR_SCORE_KEY = "blur_score"
 
+# 动作侧车（import_actions.py 产出）。目录存在就带上动作特征，不存在就不带 ——
+# 「有没有动作」是事实而不是选项，所以不做成命令行开关。
+ACTIONS_DIRNAME = "actions"
+ACTION_KEY = "action"
+STATE_KEY = "observation.state"
+ACTION_ARRAY = "action"  # npz 里的两个数组名
+STATE_ARRAY = "state"
+
 
 @dataclass
 class EpisodeFrames:
@@ -99,17 +107,22 @@ def resolve_camera_shape(info: dict, camera_key: str) -> Tuple[int, int]:
     return height, width
 
 
-def build_features(camera_key: str, height: int, width: int) -> dict:
+def build_features(
+    camera_key: str, height: int, width: int, action_dim: Optional[int] = None
+) -> dict:
     """组装 lerobot 的 features 描述。
 
-    这里是唯一描述数据集有哪些特征的地方；将来接动作数据只改这个函数。
+    这里是唯一描述数据集有哪些特征的地方。
 
     相机标 "video" 而不是 "image"：前者把帧编码成 mp4，后者把图片字节直接嵌进
     parquet。图片模式有两个在大数据量下会爆的限制 —— 单个 arrow 批次超过 2 GB
     （32 位偏移）会报错，以及一个 episode 的全部帧要同时驻留内存。视频模式两个
     都没有，代价是有损编码。
+
+    action_dim 非空时加上 action / observation.state 两列 —— 有了它们，
+    数据集才谈得上训练策略（只有 observation 的话只能训世界模型那一类）。
     """
-    return {
+    features = {
         camera_key: {
             "dtype": "video",
             "shape": (height, width, 3),
@@ -118,6 +131,12 @@ def build_features(camera_key: str, height: int, width: int) -> dict:
         SOURCE_FRAME_KEY: {"dtype": "int64", "shape": (1,), "names": None},
         BLUR_SCORE_KEY: {"dtype": "float32", "shape": (1,), "names": None},
     }
+    if action_dim is not None:
+        # 与官方 lerobot/droid_1.0.1 的口径一致：8 维 = 7 关节 + 1 夹爪。
+        # names 留 None：侧车是数据源无关的，管线不该假定轴的语义。
+        features[ACTION_KEY] = {"dtype": "float32", "shape": (action_dim,), "names": None}
+        features[STATE_KEY] = {"dtype": "float32", "shape": (action_dim,), "names": None}
+    return features
 
 
 def group_episodes(
@@ -164,11 +183,84 @@ def frame_path(dataset_dir: Path, row: dict) -> Path:
     return dataset_dir / relative
 
 
+def load_actions(dataset_dir: Path) -> Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]]:
+    """读 `dataset/meta/actions/*.npz`，返回 {源视频: (action, state)}。
+
+    目录不存在就返回 None，表示这个数据集不带动作、一切照旧。文件名（去掉后缀）
+    就是帧清单里的 `source_video`，所以取动作是一次字典查找，不做步长算术。
+    """
+    actions_dir = dataset_dir / "meta" / ACTIONS_DIRNAME
+    if not actions_dir.is_dir():
+        return None
+
+    loaded: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for path in sorted(actions_dir.glob("*.npz")):
+        try:
+            with np.load(path) as data:
+                action = data[ACTION_ARRAY]
+                state = data[STATE_ARRAY]
+        except KeyError as exc:
+            raise ValueError(
+                f"{path} 里缺少数组 {exc}；请用 import_actions.py 重新生成"
+            ) from exc
+        except OSError as exc:
+            raise ValueError(f"{path} 读不出来（文件损坏？）：{exc}") from exc
+        if action.shape != state.shape:
+            raise ValueError(
+                f"{path} 的 action {action.shape} 与 state {state.shape} 形状不一致"
+            )
+        loaded[path.stem] = (action, state)
+    return loaded or None
+
+
+def action_dim_of(
+    actions: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]]
+) -> Optional[int]:
+    """所有源视频的动作维度必须一致（lerobot 只声明一份 shape）。返回那一维。"""
+    if not actions:
+        return None
+    for name, (action, state) in actions.items():
+        if action.ndim != 2:
+            raise ValueError(f"{name} 的动作不是二维 (N, A)，实际是 {action.shape}")
+    dims = {int(action.shape[1]) for action, _ in actions.values()}
+    if len(dims) != 1:
+        raise ValueError(f"各源视频的动作维度不一致：{sorted(dims)}")
+    return dims.pop()
+
+
+def action_problem(
+    episode: EpisodeFrames, row: dict, actions: Dict[str, Tuple[np.ndarray, np.ndarray]]
+) -> Optional[str]:
+    """这一帧能不能取到动作？取不到就返回原因。
+
+    动作一旦写进 features，lerobot 就要求每帧都提供 —— 也就意味着**每一帧都必须
+    有对应动作**。缺的时候报错而不是填 0：静默填 0 等于告诉模型「此刻机器人什么
+    也没做」，而且不会报错。
+    """
+    entry = actions.get(episode.source_video)
+    if entry is None:
+        return (
+            f"源视频没有动作文件（{episode.source_video}）。"
+            f"请对它跑 import_actions.py，或把它从素材里排除：{row.get('path')}"
+        )
+    frame = row.get("source_frame")
+    if isinstance(frame, bool) or not isinstance(frame, int):
+        return f"帧清单里没有 source_frame，无法与动作对齐：{row.get('path')}"
+    rows = entry[0].shape[0]
+    if not 0 <= frame < rows:
+        return (
+            f"帧号 {frame} 超出动作范围（该源视频的动作只有 {rows} 行）："
+            f"{row.get('path')}。动作文件与视频对不上？"
+        )
+    return None
+
+
 def precheck_frames(
     episodes: Sequence[EpisodeFrames],
     dataset_dir: Path,
     height: int,
     width: int,
+    actions: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> Tuple[int, List[str]]:
     """落盘前先把所有帧验一遍，返回 (帧总数, 问题列表)。
 
@@ -190,6 +282,11 @@ def precheck_frames(
                     f"上游是旧版 format_dataset.py？请重跑前两步：{row.get('path')}"
                 )
                 continue
+            if actions is not None:
+                missing_action = action_problem(episode, row, actions)
+                if missing_action:
+                    problems.append(missing_action)
+                    continue
             if not path.is_file():
                 problems.append(f"帧文件不存在：{path}")
                 continue
@@ -308,6 +405,7 @@ def write_dataset(
     task: str,
     total_frames: int,
     vcodec: str,
+    actions: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]],
     logger: logging.Logger,
 ) -> int:
     """调 lerobot 的官方 API 把数据集写出来，返回写入的帧数。"""
@@ -330,7 +428,9 @@ def write_dataset(
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
-        features=build_features(camera_key, height, width),
+        features=build_features(
+            camera_key, height, width, action_dim=action_dim_of(actions)
+        ),
         root=output_dir,
         use_videos=True,
         robot_type="unknown",
@@ -372,21 +472,25 @@ def write_dataset(
                             non_rgb_warned = True
                         image = image.convert("RGB")
 
-                    dataset.add_frame(
-                        {
-                            # 流式编码器要的是 numpy 数组（(H,W,C) 或 (C,H,W)），
-                            # 喂 PIL 对象会在编码线程里炸 "no attribute 'shape'"
-                            camera_key: np.asarray(image, dtype=np.uint8),
-                            SOURCE_FRAME_KEY: np.array(
-                                [int(row.get("source_frame", position))], dtype=np.int64
-                            ),
-                            BLUR_SCORE_KEY: np.array(
-                                [float(row["blur_score"])], dtype=np.float32
-                            ),
-                            # lerobot 每帧必填；没有标注就传空串
-                            "task": task,
-                        }
-                    )
+                    source_frame = int(row.get("source_frame", position))
+                    frame_data = {
+                        # 流式编码器要的是 numpy 数组（(H,W,C) 或 (C,H,W)），
+                        # 喂 PIL 对象会在编码线程里炸 "no attribute 'shape'"
+                        camera_key: np.asarray(image, dtype=np.uint8),
+                        SOURCE_FRAME_KEY: np.array([source_frame], dtype=np.int64),
+                        BLUR_SCORE_KEY: np.array(
+                            [float(row["blur_score"])], dtype=np.float32
+                        ),
+                        # lerobot 每帧必填；没有标注就传空串
+                        "task": task,
+                    }
+                    if actions is not None:
+                        # 按**源视频帧号**取行，不做步长算术 —— 这也正是 source_frame
+                        # 被保留成正式列的原因。范围与存在性已由 precheck 保证。
+                        action, state = actions[episode.source_video]
+                        frame_data[ACTION_KEY] = np.asarray(action[source_frame], dtype=np.float32)
+                        frame_data[STATE_KEY] = np.asarray(state[source_frame], dtype=np.float32)
+                    dataset.add_frame(frame_data)
                     written += 1
                     bar.update(1)
 
@@ -476,9 +580,26 @@ def main() -> int:
         episode_rows = load_jsonl(dataset_dir / "meta" / EPISODES_JSONL)
         height, width = resolve_camera_shape(info, camera_key)
         episodes = group_episodes(frames, episode_rows)
+        # 自动发现，不做成开关：「有没有动作」是事实而不是选择
+        actions = load_actions(dataset_dir)
+        action_dim = action_dim_of(actions)
     except ValueError as exc:
         logger.error("%s", exc)
         return 1
+
+    if actions is None:
+        logger.info(
+            "未发现动作侧车（%s/meta/%s/），数据集不含 action/observation.state —— "
+            "「能不能训练」只剩 observation，见 README「已知限制 1」",
+            dataset_dir,
+            ACTIONS_DIRNAME,
+        )
+    else:
+        logger.info(
+            "发现 %d 个源视频的动作侧车（%d 维），数据集将带上 action/observation.state",
+            len(actions),
+            action_dim,
+        )
 
     # 帧率：默认沿用第二步的记录，显式指定则以命令行优先
     info_fps = info.get("fps")
@@ -504,7 +625,9 @@ def main() -> int:
         return 1
 
     # 校验必须在删旧目录之前：--force 会整个删掉已有数据集，若输入有问题就白丢了
-    total_frames, problems = precheck_frames(episodes, dataset_dir, height, width)
+    total_frames, problems = precheck_frames(
+        episodes, dataset_dir, height, width, actions=actions
+    )
     if problems:
         logger.error("有 %d 个帧文件不可用，未开始写入：", len(problems))
         for problem in problems:
@@ -554,6 +677,7 @@ def main() -> int:
             task=args.task,
             total_frames=total_frames,
             vcodec=args.vcodec,
+            actions=actions,
             logger=logger,
         )
     except Exception:

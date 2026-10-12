@@ -3,10 +3,15 @@
 把具身智能采集的原始视频清洗成帧图片，整理成 **LeRobot v3.0 格式**的数据集。
 
 ```
-videos/*.mp4 ──clean_video.py──▶ output/images/*.jpg ──format_dataset.py──▶ dataset/ ──export_lerobot.py──▶ lerobot_dataset/
-               抽帧 + 记录模糊分数      带原始帧号的文件名         帧清单（中间产物）        LeRobot v3.0 数据集
-                                                                                            （帧编成 mp4）
+videos/*.mp4 ──①clean_video.py──▶ output/images/*.jpg ──②format_dataset.py──▶ dataset/ ──③export_lerobot.py──▶ lerobot_dataset/
+               抽帧 + 记录模糊分数      带原始帧号的文件名         帧清单（中间产物）         组装           LeRobot v3.0 数据集
+                                                                      ▲                                       （帧编成 mp4）
+                                       动作记录（如 trajectory.h5）───┘
+                                               import_actions.py（可选，见下）
 ```
+
+**动作那一支是可选的**：有动作记录，产物里就带上 `action` / `observation.state`，数据集
+才谈得上训练策略；没有，就只产 observation（能训世界模型那一类，见「已知限制 1」）。
 
 面向**数据量大、录制时间长**的素材设计：帧不嵌进 parquet（那有两个会爆的硬限制，见第三步），
 长视频自动切成时长有上限的 episode。
@@ -15,10 +20,12 @@ videos/*.mp4 ──clean_video.py──▶ output/images/*.jpg ──format_data
 |---|---|---|---|
 | 1 | `clean_video.py` | 抽帧、记录每帧的模糊分数 | OpenCV |
 | 2 | `format_dataset.py` | 生成帧清单，按阈值标记模糊帧 | 标准库 |
+| — | `import_actions.py` | **可选**：把外部动作记录转成侧车，供第三步消费 | numpy（droid 格式另需 h5py） |
 | 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集 | lerobot |
 
 第二步的产物 `dataset/` 是**中间产物**，供第三步消费。它可读、可查、便于调试，但不是
-LeRobot 数据集。
+LeRobot 数据集。`import_actions.py` 排在第二步之后、第三步之前——它只写 `dataset/meta/actions/`，
+不碰别的产物。
 
 **模糊帧一律保留，只做标记。** 被丢弃的帧会让时间轴出现空洞，而 lerobot 的整套时序逻辑
 都假设帧等间隔排列 —— 空洞会让它的 `delta_timestamps` 静默取到错误的时间点。因此过滤是
@@ -310,6 +317,8 @@ frame["observation.images.front"]    # (3, H, W) float32，取值 [0, 1]，按�
 frame["timestamp"]                   # 相对本 episode 起点的时间戳，见下
 frame["source_frame"]                # 原始视频里的帧号（跨 episode 唯一）
 frame["blur_score"]                  # Laplacian 方差；下游按它自行过滤模糊帧
+frame["action"]                      # (A,) 动作；只有接了动作数据才有（见「接动作数据」）
+frame["observation.state"]           # (A,) 状态；同上
 ```
 
 ### 数据集结构
@@ -405,6 +414,64 @@ pip install --force-reinstall --no-deps opencv-python
 
 ---
 
+## 接动作数据（可选）
+
+```bash
+python import_actions.py --format droid --input videos --dataset dataset
+```
+
+排位在**第二步之后、第三步之前**（不在三步管线里，但第三步依赖它的产物）。它回答一个问题：
+这份数据集能不能训练策略。只有 observation 的话只能训世界模型、视频预测那一类（见「已知限制 1」）。
+
+### 为什么单开一个脚本
+
+动作记录是**另一个来源**（DROID 是 `trajectory.h5`，别处可能是 CSV / npz / JSON），这些格式是
+数据源的「方言」——管线不该认识它们。所以先用一个适配器把方言翻成统一格式：
+
+```
+<素材目录> ──import_actions.py──▶ dataset/meta/actions/<源视频>.npz
+   （各方言）                            action (N, A) / state (N, A)
+```
+
+好处是**转完就能把原始素材归档掉**：第三步只面对侧车，不会在导出时又回头去读几百 GB 的原始
+记录。换数据源也只是加一个适配函数（`SOURCES` 字典 + 一个 `find_*_sources`）。
+
+### 侧车格式
+
+每个源视频一个 `.npz`，文件名就是帧清单里的 `source_video`（即第一步算出的文件名前缀）。
+里面两列：
+
+| 数组 | 含义 |
+|---|---|
+| `action` | 该帧**下发的指令** |
+| `state` | 该帧**实际的状态** |
+
+**第 i 行对应源视频第 i 帧**，不是抽帧后的第 i 帧——所以第三步的 join 直接是
+`actions[source_frame]`，不做任何步长算术。这正是当初把 `source_frame` 保留成正式列的原因。
+
+### DROID 格式取哪几列
+
+8 维 = 7 关节 + 1 夹爪，与官方 `lerobot/droid_1.0.1` 的 `action` / `observation.state` 定义一致：
+
+| 数据集列 | h5 来源 |
+|---|---|
+| `action` | `action/joint_position` (7) ⊕ `action/gripper_position` (1) |
+| `observation.state` | `action/robot_state/joint_positions` (7) ⊕ `action/robot_state/gripper_position` (1) |
+
+**两者不能混用**：`action/` 是下发的指令，`action/robot_state/` 是实际状态，实测两者平均差
+约 1.5°（跟踪误差）。用错了不会报错，只会让模型学到「命令和结果是一回事」。
+
+### 动作必须齐备
+
+一旦侧车里有了某个源视频，第三步就要求**它的每一帧都能取到动作**——缺了在落盘前报错，
+不填默认值。理由和 `blur_score` 一样：静默填 0 等于告诉模型「此刻机器人什么也没做」，而且
+不会报错。
+
+只给一部分源视频动作是不行的（lerobot 要求声明的特征每帧都有）。要么补齐，要么把那些素材
+从 `videos/` 里排除。
+
+---
+
 ## 辅助工具：模糊阈值标定
 
 ```bash
@@ -467,8 +534,8 @@ Laplacian 方差分布通常不是双峰的，任何自动选阈值的做法都�
 ## 测试
 
 ```bash
-pytest            # 176 个用例，约 2 秒
-pytest -m slow    # 6 个用例，含真实调用 lerobot，约 10 秒
+pytest            # 186 个用例，约 2 秒
+pytest -m slow    # 8 个用例，含真实调用 lerobot，约 10 秒
 ```
 
 第三步的测试分两层：不碰 lerobot 的纯逻辑（读清单、组装特征、校验帧文件）在默认套件中，
@@ -485,18 +552,20 @@ pytest -m slow    # 6 个用例，含真实调用 lerobot，约 10 秒
 
 ## 已知限制
 
-### 1. 不能直接训练策略
+### 1. 动作数据得自己提供
 
-LeRobot 是**模仿学习**数据集，核心是 `(observation, action)` 配对，而本项目产出的只有
-observation —— 没有 `action`、`state`、`reward`。
+LeRobot 是**模仿学习**数据集，核心是 `(observation, action)` 配对。本项目**采集**的只有
+observation —— 动作推不出来，必须有另外的来源（机器人日志、遥操作记录等）。
 
-数据集**可以被 `lerobot` 的 loader 加载**（第三步做到的），可用于感知预训练、世界模型、
-视频预测，但**训练不了策略**。这不是软件层面的问题：动作数据无法从视频推出，需要另外的
-来源（机器人日志、遥操作记录等）。
+所以分两种情况：
 
-接入点已经留好：`build_features()` 是唯一描述数据集有哪些特征的地方，帧的组装也集中在
-一处。将来有动作数据时按 `source_frame` 对齐 join 即可 —— 这也正是 `source_frame` 被
-作为正式列写入数据集的原因。
+- **有动作记录**（走 `import_actions.py`，见「接动作数据」）→ 产物里带 `action` 和
+  `observation.state`，**能训练策略**（ACT / diffusion policy / SmolVLA 之类）。
+- **没有** → 只有 observation，能训感知预训练、世界模型、视频预测那一类，训不了策略。
+
+`import_actions.py` 目前只带一个 DROID 适配器。换数据源要自己加一个 `find_*_sources`
+（从素材目录找到动作文件）和一个 `load_*`（读出来并并成 `(N, 8)`）——转换本身是格式适配，
+不涉及管线逻辑。
 
 ### 2. `delta_timestamps` 已可用，但有三处要注意
 

@@ -4,6 +4,10 @@ numpy
 tqdm
 pytest
 
+# import_actions.py 的 droid 适配器要读 trajectory.h5。
+# 只有接 DROID 格式的动作数据才需要；前面几步和第三步都不用它。
+h5py
+
 # 第三步（export_lerobot.py）
 #
 # lerobot 的依赖很重（torch、torchvision、datasets、av、wandb……，约 1~2 GB），

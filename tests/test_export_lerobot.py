@@ -13,6 +13,7 @@ import logging
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import export_lerobot as ex
@@ -72,6 +73,28 @@ def episodes_of(dataset_dir: Path):
 def break_one_frame(dataset_dir: Path) -> None:
     """弄丢一个帧文件，把流程挡在落盘之前。"""
     next((dataset_dir / "videos").rglob("*.jpg")).unlink()
+
+
+@pytest.fixture
+def write_actions():
+    """往 dataset/meta/actions/ 写动作侧车。
+
+    spec 形如 ``{"1": 40}``（源视频 → 动作行数）。**第 i 行的每个分量都填 i**，
+    于是「取到了第几行」可以直接从数值读出来 —— 这正是这组测试要抓的东西：
+    join 错了（比如按抽帧后的位置取而不是 source_frame）不会报错，只会静默配错。
+    """
+
+    def _write(dataset_dir: Path, spec: dict, dim: int = 8) -> Path:
+        out = dataset_dir / "meta" / "actions"
+        out.mkdir(parents=True, exist_ok=True)
+        for name, rows in spec.items():
+            action = np.tile(
+                np.arange(rows, dtype=np.float32).reshape(-1, 1), (1, dim)
+            )
+            np.savez_compressed(out / f"{name}.npz", action=action, state=action + 100.0)
+        return out
+
+    return _write
 
 
 @pytest.fixture
@@ -155,6 +178,38 @@ def test_build_features_declares_custom_columns():
         "observation.images.front",
         ex.SOURCE_FRAME_KEY,
     ]
+
+
+def test_build_features_declares_action_and_state_when_asked():
+    """带动作的数据集才声明这两列 —— 「有没有动作」是事实，不是选项。"""
+    plain = ex.build_features("observation.images.front", 480, 640)
+    assert ex.ACTION_KEY not in plain and ex.STATE_KEY not in plain
+
+    with_actions = ex.build_features("observation.images.front", 480, 640, action_dim=8)
+    # shape 是 (8,)（元组）不是 (8, 1)：lerobot 按声明逐项比对 add_frame 的数组
+    assert with_actions[ex.ACTION_KEY] == {
+        "dtype": "float32",
+        "shape": (8,),
+        "names": None,
+    }
+    assert with_actions[ex.STATE_KEY]["shape"] == (8,)
+    assert with_actions[ex.STATE_KEY]["dtype"] == "float32"
+
+
+def test_action_dim_requires_uniform_dimensions():
+    """lerobot 只声明一份 shape，所以各源视频的维度必须一致。"""
+    eight = np.zeros((10, 8), dtype=np.float32)
+    seven = np.zeros((10, 7), dtype=np.float32)
+    assert ex.action_dim_of({"x": (eight, eight)}) == 8
+    assert ex.action_dim_of(None) is None
+    with pytest.raises(ValueError, match="维度不一致"):
+        ex.action_dim_of({"x": (eight, eight), "y": (seven, seven)})
+
+
+def test_action_dim_rejects_non_2d():
+    flat = np.zeros((10,), dtype=np.float32)
+    with pytest.raises(ValueError, match="不是二维"):
+        ex.action_dim_of({"x": (flat, flat)})
 
 
 # --------------------------------------------------------------------------
@@ -345,6 +400,78 @@ def test_frame_path_rejects_absolute_path(tmp_path):
         ex.frame_path(tmp_path, {"path": str(tmp_path / "x.jpg")})
 
 
+def test_load_actions_returns_none_without_sidecar(built_dataset):
+    """没有侧车目录 = 这个数据集不带动作，一切照旧。"""
+    assert ex.load_actions(built_dataset({"1": [0]})) is None
+
+
+def test_load_actions_reads_sidecar(built_dataset, write_actions):
+    dataset_dir = built_dataset({"1": [0, 6]})
+    write_actions(dataset_dir, {"1": 20})
+    loaded = ex.load_actions(dataset_dir)
+    assert set(loaded) == {"1"}
+    action, state = loaded["1"]
+    assert action.shape == (20, 8)
+    # 夹具把第 i 行填成 i，所以「取到第几行」能从数值读出来
+    assert action[3].tolist() == [3.0] * 8
+    assert state[3].tolist() == [103.0] * 8
+
+
+def test_load_actions_rejects_mismatched_arrays(built_dataset):
+    """action 与 state 行数不一致说明侧车坏了，不能猜。"""
+    dataset_dir = built_dataset({"1": [0]})
+    out = dataset_dir / "meta" / "actions"
+    out.mkdir(parents=True)
+    np.savez_compressed(
+        out / "1.npz",
+        action=np.zeros((5, 8), dtype=np.float32),
+        state=np.zeros((6, 8), dtype=np.float32),
+    )
+    with pytest.raises(ValueError, match="形状不一致"):
+        ex.load_actions(dataset_dir)
+
+
+def test_load_actions_reports_missing_array(built_dataset):
+    dataset_dir = built_dataset({"1": [0]})
+    out = dataset_dir / "meta" / "actions"
+    out.mkdir(parents=True)
+    np.savez_compressed(out / "1.npz", action=np.zeros((5, 8), dtype=np.float32))
+    with pytest.raises(ValueError, match="缺少数组"):
+        ex.load_actions(dataset_dir)
+
+
+def test_precheck_requires_actions_for_every_source_video(built_dataset, fixture_hw, write_actions):
+    """声明了动作就必须每帧都有，缺一个源视频也要拦下 —— 不填默认值。"""
+    dataset_dir = built_dataset({"1": [0, 6], "2": [0, 6]})
+    write_actions(dataset_dir, {"1": 20})  # 只给 1，2 没有
+    actions = ex.load_actions(dataset_dir)
+    _, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+    )
+    assert problems and all("没有动作文件" in p for p in problems)
+
+
+def test_precheck_detects_frame_beyond_action_range(built_dataset, fixture_hw, write_actions):
+    """帧号超出动作行数 = 动作文件与视频不是同一批，不能猜。"""
+    dataset_dir = built_dataset({"1": [0, 6, 12]})  # 最大帧号 12
+    write_actions(dataset_dir, {"1": 3})  # 动作只有 3 行
+    actions = ex.load_actions(dataset_dir)
+    _, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+    )
+    assert problems and any("超出动作范围" in p for p in problems)
+
+
+def test_precheck_passes_when_actions_cover_every_frame(built_dataset, fixture_hw, write_actions):
+    dataset_dir = built_dataset({"1": [0, 6, 12]})
+    write_actions(dataset_dir, {"1": 40})
+    actions = ex.load_actions(dataset_dir)
+    total, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+    )
+    assert (total, problems) == (3, [])
+
+
 def test_precheck_passes_on_good_frames(built_dataset, fixture_hw):
     dataset_dir = built_dataset({"1": [0, 6, 12]})
     height, width = fixture_hw
@@ -501,6 +628,47 @@ def test_delta_timestamps_lands_on_the_requested_times(built_dataset, run_export
     assert frame["source_frame_is_pad"].tolist() == [False, False, False]
     # 单帧字段仍在，说明窗口只作用于列进 delta_timestamps 的那些键
     assert float(frame["timestamp"]) == pytest.approx(0.4, abs=1e-6)
+
+
+@pytest.mark.slow
+def test_end_to_end_with_actions_lands_on_the_right_frames(
+    built_dataset, run_export, tmp_path, write_actions
+):
+    """带动作写一遍再读回来，逐帧核对数值。
+
+    join 错了不会报错，只会让模型学到错的东西 —— 所以这里不满足于「有 action 列」，
+    而是看**每一帧拿到的是不是它自己那一帧的动作**。夹具把侧车的第 i 行填成 i，
+    于是每帧的 action 应当恰好等于它的 source_frame。
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset_dir = built_dataset({"1": [0, 6, 12]})
+    write_actions(dataset_dir, {"1": 40})
+    out = tmp_path / "lr"
+    assert run_export("--input", dataset_dir, "--output", out) == 0
+
+    ds = LeRobotDataset("local/embodied-videos", root=out)
+    source_frames = [int(ds[i]["source_frame"]) for i in range(3)]
+    assert source_frames == [0, 6, 12]
+    for index, source_frame in enumerate(source_frames):
+        assert ds[index]["action"].numpy() == pytest.approx([source_frame] * 8)
+        assert ds[index]["observation.state"].numpy() == pytest.approx(
+            [source_frame + 100.0] * 8
+        )
+
+
+@pytest.mark.slow
+def test_export_without_actions_stays_action_free(built_dataset, run_export, tmp_path):
+    """没有侧车时不能凭空多出 action 列 —— 旧行为要原样保留。"""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset_dir = built_dataset({"1": [0, 6]})
+    out = tmp_path / "lr"
+    assert run_export("--input", dataset_dir, "--output", out) == 0
+
+    ds = LeRobotDataset("local/embodied-videos", root=out)
+    assert ex.ACTION_KEY not in ds.meta.features
+    assert ex.STATE_KEY not in ds.meta.features
 
 
 @pytest.mark.slow
