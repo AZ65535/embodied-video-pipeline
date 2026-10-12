@@ -216,7 +216,11 @@ def check_encoder_drops(dataset, label: str, logger: logging.Logger) -> None:
     读的是 lerobot 的私有计数。拿不到不算失败（免得它升级就崩），但会告警说明
     「这次没能核对」，而不是假装核对过了。
     """
-    encoder = getattr(dataset, "_streaming_encoder", None)
+    # 挂载位置随版本变过：0.4.x 是 dataset._streaming_encoder，0.6 起 create() 把它
+    # 交给 DatasetWriter 保管，于是变成 dataset.writer._streaming_encoder。
+    # 也就是说现在这一条依赖着两处私有结构，比升级前更脆（见 ROADMAP 中#3）。
+    writer = getattr(dataset, "writer", None)
+    encoder = getattr(writer, "_streaming_encoder", None)
     dropped = getattr(encoder, "_dropped_frames", None)
     if not isinstance(dropped, dict):
         logger.warning(
@@ -310,9 +314,10 @@ def write_dataset(
     # 延迟导入：lerobot 会连带拉起 torch，要好几秒。放函数里，
     # 本模块不碰 lerobot 的纯逻辑测试就能保持秒级。
     from lerobot import __version__ as lerobot_version
+    from lerobot.configs.video import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION, LeRobotDataset
 
-    # 版本决定格式（0.3.x 写 v2.1，0.4.x 写 v3.0），而本项目针对 0.4.4 / v3.0 开发验证。
+    # 版本决定格式（0.3.x 写 v2.1，0.4.x 起写 v3.0），而本项目针对 0.6.1 / v3.0 开发验证。
     # requirements.txt 里已 pin，但那只挡 pip 安装；这里把实际版本打出来便于排查。
     logger.info("lerobot %s，输出格式 %s", lerobot_version, CODEBASE_VERSION)
     if CODEBASE_VERSION != "v3.0":
@@ -329,7 +334,10 @@ def write_dataset(
         root=output_dir,
         use_videos=True,
         robot_type="unknown",
-        vcodec=vcodec,
+        # 0.6 起编码参数收进 RGBEncoderConfig（0.5 及以前是 create() 的直接参数）。
+        # 只传 vcodec，其余保持默认：g=2、crf=30、pix_fmt=yuv420p —— 与旧版一致，
+        # 产物不变。将来要调 GOP/质量就改这里。
+        rgb_encoder=RGBEncoderConfig(vcodec=vcodec),
         # 不开的话，帧会先落成 PNG 到临时目录、等 episode 结束再统一编码 ——
         # 等于把中间产物又写一遍。开着则直接流式喂给编码线程，save_episode()
         # 几乎是瞬时的，内存也不随 episode 长度增长。
@@ -338,7 +346,9 @@ def write_dataset(
         # 调大给突发留余量；真跟不上会被 check_encoder_drops 抓住并报错。
         encoder_queue_maxsize=300,
     )
-    logger.info("视频编码器：%s（流式编码已开启）", dataset.vcodec)
+    # 只报「请求的」编码器：0.6 起 dataset 上不再有 .vcodec 属性（也不去碰私有字段），
+    # 而 --vcodec auto 实际选中哪个由 lerobot 自己打日志（"Auto-selected video codec"）
+    logger.info("视频编码器：%s（流式编码已开启）", vcodec)
 
     written = 0
     non_rgb_warned = False

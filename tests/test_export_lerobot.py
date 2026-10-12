@@ -238,8 +238,18 @@ class FakeEncoder:
         self._dropped_frames = dropped if dropped is not None else {}
 
 
+def fake_dataset(encoder):
+    """按 lerobot 0.6 的挂载方式造假 dataset：编码器挂在 writer 上。
+
+    0.4.x 是 dataset._streaming_encoder，0.6 起 create() 把它交给 DatasetWriter，
+    这个路径变过一次，升级时检查静默降级成了告警（下面第三条用例就是那次事故）。
+    """
+    writer = type("Writer", (), {"_streaming_encoder": encoder})()
+    return type("Dataset", (), {"writer": writer})()
+
+
 def test_encoder_drop_check_passes_when_nothing_was_dropped(caplog):
-    dataset = type("D", (), {"_streaming_encoder": FakeEncoder()})()
+    dataset = fake_dataset(FakeEncoder())
     with caplog.at_level(logging.WARNING):
         ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
@@ -247,14 +257,18 @@ def test_encoder_drop_check_passes_when_nothing_was_dropped(caplog):
 
 def test_encoder_drop_check_fails_loudly_on_dropped_frames():
     """丢帧意味着视频比 parquet 少几帧，帧网格不再均匀 —— 必须炸，不能只 warning。"""
-    dataset = type("D", (), {"_streaming_encoder": FakeEncoder({"observation.images.front": 3})})()
+    dataset = fake_dataset(FakeEncoder({"observation.images.front": 3}))
     with pytest.raises(RuntimeError, match="丢了 3 帧"):
         ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
 
 
 def test_encoder_drop_check_warns_when_lerobot_changed(caplog):
-    """读不到计数时告警说明「没能核对」，而不是假装核对过了。"""
-    dataset = type("D", (), {"_streaming_encoder": object()})()
+    """读不到计数时告警说明「没能核对」，而不是假装核对过了。
+
+    用「连 writer 都没有」来模拟挂载位置又变了 —— 这正是升级到 0.6 时发生的事，
+    当时 12 个 episode 全部静默降级成告警（导出照常成功，防护悄悄没了）。
+    """
+    dataset = type("Dataset", (), {})()
     with caplog.at_level(logging.WARNING):
         ex.check_encoder_drops(dataset, "episode 0", logging.getLogger("t"))
     assert "无法核对" in caplog.text

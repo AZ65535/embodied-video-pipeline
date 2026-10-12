@@ -31,8 +31,17 @@ LeRobot 数据集。
 pip install -r requirements.txt
 ```
 
-前两步需要 `opencv-python`、`numpy`、`tqdm`、`pytest`；第三步另外需要 `pillow` 和
-`lerobot`（含 torch，约 1~2 GB），**只跑前两步可以不装**。
+**需要 Python 3.12 或更高**（lerobot 0.6 起的要求；本项目在 Python 3.12 的 conda 环境
+`line2` 上开发验证）。前两步需要 `opencv-python`、`numpy`、`tqdm`、`pytest`；第三步另外
+需要 `pillow` 和 `lerobot`（含 torch，约 1~2 GB），**只跑前两步可以不装**。
+
+第三步装的是 `lerobot[dataset]`——0.6 把 `datasets`/`pyarrow`/`torchcodec` 挪进了这个
+可选组，裸装 `lerobot` 写不出数据集。另外 `av` 需要显式安装：lerobot 0.6.1 把它从依赖里
+拿掉了，但数据集代码仍然无条件 import 它（上游的打包疏漏，requirements.txt 里已注明）。
+
+**装完还要卸掉一个**：`pip uninstall -y torchcodec`。它在 Windows 上找不到匹配的 FFmpeg
+共享库，留着每次 import 都会崩一段 traceback 再退回 pyav；卸掉只剩一行提示，行为完全一样
+（我们本来就用 pyav）——它只影响训练时读数据的速度，与写数据集无关。详见 ROADMAP 低#7。
 
 装 lerobot 时 pip 会用 `opencv-python-headless` 覆盖已有的 `opencv-python`（两者共用
 `cv2/` 目录），见第三步的注意事项。
@@ -270,7 +279,7 @@ parquet 里只放数值列。这是 lerobot 的默认模式，也是生态惯例
 
 | 编码器 | 编码速度（1080p 实测） | 解码代价 | 备注 |
 |---|---|---|---|
-| `h264`（默认） | ~8.5 fps | 约为读图片的 **2.2 倍** | 各种尺寸都能用 |
+| `h264`（默认） | ~8.5 fps | 约为读图片的 **2.2 倍** | 各种尺寸都能用（宽高须为偶数，见「已知限制 7」） |
 | `libsvtav1` | ~17.9 fps | 约为读图片的 **5 倍** | **16×32 这种小图会让进程直接崩** |
 | `auto` | 最快（走硬件编码器） | 视硬件而定 | 硬件编码器有最小尺寸要求，小图会失败 |
 
@@ -371,9 +380,11 @@ lerobot 的 `create()` 要求输出目录**不存在**，因此 `--force` 的语
 生成」，而非「往上覆盖」。重建结果必然是干净的，不存在上一轮的残留文件。（第二步的
 `--force` 行为不同，会保留旧文件，见「已知限制」。）
 
-**编码参数不可调。** lerobot 把 `g=2`（**每 2 帧一个关键帧**）和 `crf=30` 硬编码在
-`StreamingVideoEncoder` 的构造里，只暴露 `vcodec`。短 GOP 是为随机访问优化的，代价是
-压缩率 —— 这也是为什么视频模式省下的空间没有通用编码那么夸张（调研里常见 10~20 倍）。
+**编码参数。** lerobot 0.6 把编码参数收进了 `RGBEncoderConfig`（`g`、`crf`、`pix_fmt`、
+`preset`……都可调），但**本脚本只传 `vcodec`**，其余保持默认，与旧版一致 —— `g=2`
+（**每 2 帧一个关键帧**）和 `crf=30`。短 GOP 是为随机访问优化的，代价是压缩率 ——
+这也是为什么视频模式省下的空间没有通用编码那么夸张（调研里常见 10~20 倍）。
+要调就改 `write_dataset()` 里那行 `RGBEncoderConfig(vcodec=vcodec)`。
 
 ### 注意事项
 
@@ -560,3 +571,18 @@ Laplacian 方差是**绝对量**，随分辨率、对比度和光照变化。`10
 ### 6. 硬链接的双向性
 
 见「文件落盘方式」。`dataset/` 与 `output/images/` 共享同一份数据。
+
+### 7. 素材宽高必须是偶数
+
+视频编码器用 `yuv420p`（色度按 2x2 下采样），要求宽高都是偶数。**正常素材不会踩到** ——
+摄像头和 h264 都产不出奇数尺寸的 mp4，只有非 4:2:0 编码的（ProRes、RGB、4:4:4）才可能
+带奇数尺寸进来。
+
+真踩到时，第三步会在 lerobot 内部报 `Generic error in an external library`，**看不出是
+尺寸问题**，而且数据集已经写了一半。**管线不处理它**：不做补齐，也不改用 4:4:4 编码
+（实测体积几乎不变，但解码慢 3.4 倍）—— 正常素材遇不到，而补齐会成为整条管线上唯一
+悄悄改动像素的地方。在输入侧解决即可：
+
+```bash
+ffmpeg -i 原视频.mp4 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" 新视频.mp4
+```

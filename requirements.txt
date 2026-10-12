@@ -9,12 +9,31 @@ pytest
 # lerobot 的依赖很重（torch、torchvision、datasets、av、wandb……，约 1~2 GB），
 # 只跑前两步的话不需要装。
 #
-# 必须限定版本：lerobot 的**包版本决定数据集格式版本**（0.3.x = v2.1，0.4.x = v3.0），
-# 而本项目的代码依赖 v3.0 的目录布局。升到 0.5 大概率会换格式并让脚本失效。
+# 必须限定版本：0.6 改了 create() 的编码参数（vcodec → rgb_encoder），本项目按 0.6 写。
+# 注意**数据集格式仍是 v3.0**（0.6.1 实测确认）——升级改的是调用方式，不是产物布局，
+# 已生成的数据集不受影响。（0.3.x 是 v2.1、0.4.x 起是 v3.0 那条规律仍然成立。）
+#
+# 0.6 起要求 Python >= 3.12。
 pillow
-lerobot>=0.4.4,<0.5
+# [dataset] 这个可选组里是 datasets / pandas / pyarrow / torchcodec。
+# 0.6 把它们从核心依赖挪成了可选组，裸装 lerobot 写不出数据集。
+lerobot[dataset]>=0.6.1,<0.7
+# av（PyAV）必须显式装：lerobot 0.6.1 把 av 从依赖里拿掉了，但
+# datasets/video_utils.py 第 33 行仍然是无条件 import av，不装就 ImportError。
+# 这是上游的打包疏漏（它们把 av 放进了开发用的 dependency-groups），我们替它补上。
+av>=15
 
 # 另外：lerobot 依赖 opencv-python-headless，它与 opencv-python 共用同一个 cv2/
 # 目录，安装后会把前两步用的 cv2 覆盖成 headless 版（无 GUI 功能）。
 # 恢复方法见 README「第三步 → 注意事项」。
+
+# 装完之后还要卸掉一个包：
+#
+#     pip uninstall -y torchcodec
+#
+# [dataset] 组在 Windows 上会顺带装 torchcodec，但它在本机加载不了（找不到匹配的
+# FFmpeg 共享库：本机只有 FFmpeg 9，而它最高支持到 8；能支持 9 的版本又要 torch≥2.12，
+# 与 lerobot 的 torch<2.12 冲突）。留着它每次 import 都会崩一段 traceback 再退回 pyav，
+# 卸掉之后只剩一行提示，行为完全一样 —— 因为我们本来就用 pyav。
+# 它只是个解码器（影响训练时读数据的速度），与写数据集无关，详见 ROADMAP 低#7。
 
