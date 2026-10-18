@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 import export_lerobot as ex
+import pipeline_common as pc
 
 
 @pytest.fixture
@@ -65,8 +66,8 @@ def _implied_fps(frame_numbers: list, target_fps: int = 5) -> float:
 def episodes_of(dataset_dir: Path):
     """把 dataset/ 里的两份清单读进来并分组。"""
     return ex.group_episodes(
-        ex.load_jsonl(dataset_dir / "meta" / ex.FRAMES_JSONL),
-        ex.load_jsonl(dataset_dir / "meta" / ex.EPISODES_JSONL),
+        pc.read_jsonl(dataset_dir / "meta" / ex.FRAMES_JSONL),
+        pc.read_jsonl(dataset_dir / "meta" / ex.EPISODES_JSONL),
     )
 
 
@@ -104,7 +105,7 @@ def fixture_hw(tiny_jpegs) -> tuple:
     不硬编码尺寸：夹具按字母序排，顺序一变硬编码就会静默失准。
     probe_jpeg 返回的是 (width, height)，注意反过来。
     """
-    width, height = ex.format_dataset.probe_jpeg(tiny_jpegs[0])
+    width, height = pc.probe_jpeg(tiny_jpegs[0])
     return height, width
 
 
@@ -125,22 +126,22 @@ def write_frames_jsonl(dataset_dir: Path, rows: list) -> None:
 # --------------------------------------------------------------------------
 
 
-def test_load_jsonl_reads_rows(tmp_path):
+def test_read_jsonl_reads_rows(tmp_path):
     path = tmp_path / "x.jsonl"
     path.write_text('{"a": 1}\n\n{"a": 2}\n', encoding="utf-8")
-    assert ex.load_jsonl(path) == [{"a": 1}, {"a": 2}]
+    assert pc.read_jsonl(path) == [{"a": 1}, {"a": 2}]
 
 
-def test_load_jsonl_rejects_missing_file(tmp_path):
-    with pytest.raises(ValueError, match="请先跑 format_dataset.py"):
-        ex.load_jsonl(tmp_path / "nope.jsonl")
+def test_read_jsonl_rejects_missing_file(tmp_path):
+    with pytest.raises(ValueError, match="缺少文件"):
+        pc.read_jsonl(tmp_path / "nope.jsonl")
 
 
-def test_load_jsonl_reports_line_number_on_bad_json(tmp_path):
+def test_read_jsonl_reports_line_number_on_bad_json(tmp_path):
     path = tmp_path / "x.jsonl"
     path.write_text('{"a": 1}\nnot json\n', encoding="utf-8")
     with pytest.raises(ValueError, match="第 2 行"):
-        ex.load_jsonl(path)
+        pc.read_jsonl(path)
 
 
 # --------------------------------------------------------------------------

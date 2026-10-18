@@ -25,16 +25,22 @@ import shutil
 import statistics
 import sys
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
-# 第一步写在这两个文件里；本工具只读它们，不碰视频
-BLUR_SCORES_FILENAME = "_scores.jsonl"
-IMAGES_META_FILENAME = "_meta.json"
+from pipeline_common import (
+    BLUR_SCORES_FILENAME,
+    DEFAULT_BLUR_THRESHOLD,
+    IMAGES_META_FILENAME,
+    frame_filename,
+    is_blurry,
+    read_blur_scores,
+    setup_logging,
+    write_jsonl,
+)
 
-DEFAULT_THRESHOLD = 100.0
+DEFAULT_THRESHOLD = DEFAULT_BLUR_THRESHOLD
 DEFAULT_BAND = 3.0
 DEFAULT_EXPORT_MAX = 150
 
@@ -82,16 +88,7 @@ def load_scores(images_dir: Path) -> List[VideoScores]:
             "请先跑 clean_video.py --input <视频目录> --output <输出目录>"
         )
 
-    grouped: Dict[str, Dict[int, float]] = defaultdict(dict)
-    for lineno, line in enumerate(scores_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-            grouped[str(row["video"])][int(row["source_frame"])] = float(row["blur_score"])
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("跳过 %s 第 %d 行（%s）", scores_path, lineno, exc)
-
+    grouped = read_blur_scores(scores_path, logger)
     if not grouped:
         raise ValueError(f"{scores_path} 里没有任何可用的分数")
 
@@ -169,13 +166,10 @@ def histogram(
 
 
 def filter_rate(scores: Sequence[float], threshold: float) -> float:
-    """低于阈值的比例（严格小于：等于阈值算清晰）。
-
-    口径与 format_dataset.is_blurry()、clean_video.is_frame_blurry() 一致。
-    """
+    """低于阈值的比例（严格小于：等于阈值算清晰）。口径见 pipeline_common.is_blurry。"""
     if not scores:
         return 0.0
-    return sum(1 for s in scores if s < threshold) / len(scores)
+    return sum(1 for s in scores if is_blurry(s, threshold)) / len(scores)
 
 
 def print_distribution(result: VideoScores, logger: logging.Logger) -> None:
@@ -257,7 +251,7 @@ def export_review_frames(
     for kind, group in (("below", below), ("critical", critical)):
         target = below_dir if kind == "below" else critical_dir
         for index, score in group:
-            source = images_dir / f"{result.name}_frame_{index:06d}.jpg"
+            source = images_dir / frame_filename(result.name, index)
             if not source.is_file():
                 logger.warning("帧文件不存在，跳过：%s", source)
                 continue
@@ -279,23 +273,17 @@ def write_scores_jsonl(
     path: Path, results: Sequence[VideoScores], thresholds: Sequence[float]
 ) -> None:
     """每帧一行，供复现或另行分析。"""
-    with path.open("w", encoding="utf-8") as handle:
-        for result in results:
-            for index, score in zip(result.frame_indices, result.scores):
-                handle.write(
-                    json.dumps(
-                        {
-                            "video": result.name,
-                            "source_frame": index,
-                            "blur_score": round(score, 4),
-                            "below": {
-                                f"{t:g}": score < t for t in thresholds
-                            },
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n"
-                )
+    rows = (
+        {
+            "video": result.name,
+            "source_frame": index,
+            "blur_score": round(score, 4),
+            "below": {f"{t:g}": is_blurry(score, t) for t in thresholds},
+        }
+        for result in results
+        for index, score in zip(result.frame_indices, result.scores)
+    )
+    write_jsonl(path, rows)
 
 
 def parse_args() -> argparse.Namespace:
@@ -333,13 +321,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
-
-
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
 
 
 def main() -> int:

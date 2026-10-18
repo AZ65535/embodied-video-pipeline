@@ -24,7 +24,6 @@
     python import_actions.py --format droid --input videos --dataset dataset
 """
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -32,12 +31,18 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-# 复用第一步的前缀规则。两处各写一套的话，迟早会漂移成「看起来一样但不一致」——
-# 而这里一旦不一致，表现是动作静默配错帧，不报错。
-from clean_video import video_output_prefix
-
-ACTIONS_DIRNAME = "actions"
-EPISODES_JSONL = "episodes.jsonl"
+# 前缀规则与链路清单的文件名都来自公共层。这里不再 import clean_video：
+# 那个模块会连带拉起 cv2/tqdm，而本脚本只需要 pathlib 和 numpy。
+from pipeline_common import (
+    ACTIONS_DIRNAME,
+    ACTION_ARRAY,
+    EPISODES_JSONL,
+    META_DIRNAME,
+    STATE_ARRAY,
+    read_jsonl,
+    setup_logging,
+    video_output_prefix,
+)
 
 # DROID 的字段映射。8 维 = 7 关节 + 1 夹爪，对齐官方 lerobot/droid_1.0.1 的
 # action / observation.state 定义。
@@ -49,20 +54,6 @@ DROID_STATE_FIELDS = (
     "action/robot_state/joint_positions",
     "action/robot_state/gripper_position",
 )
-
-
-def read_jsonl(path: Path) -> List[dict]:
-    if not path.is_file():
-        raise ValueError(f"缺少文件：{path}（请先跑 format_dataset.py）")
-    rows: List[dict] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{path} 第 {line_no} 行不是合法 JSON：{exc}") from exc
-    return rows
 
 
 def stack_fields(h5, fields: Tuple[str, ...]) -> np.ndarray:
@@ -137,10 +128,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-
 def main() -> int:
     args = parse_args()
     logger = logging.getLogger("import_actions")
@@ -152,7 +139,9 @@ def main() -> int:
         return 1
 
     try:
-        episodes = read_jsonl(dataset_dir / "meta" / EPISODES_JSONL)
+        episodes = read_jsonl(
+            dataset_dir / META_DIRNAME / EPISODES_JSONL, missing_hint="请先跑 format_dataset.py"
+        )
     except ValueError as exc:
         logger.error("%s", exc)
         return 1
@@ -168,7 +157,7 @@ def main() -> int:
     logger.info("帧清单里有 %d 个源视频，正在素材目录里找 %s 格式的动作记录…", len(wanted), args.format)
     sources = SOURCES[args.format](input_dir)
 
-    out_dir = dataset_dir / "meta" / ACTIONS_DIRNAME
+    out_dir = dataset_dir / META_DIRNAME / ACTIONS_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)
 
     converted: List[str] = []
@@ -191,7 +180,7 @@ def main() -> int:
         except Exception as exc:  # h5 损坏、字段缺失等等
             failures.append((name, f"{type(exc).__name__}: {exc}"))
             continue
-        np.savez_compressed(dst, action=action, state=state)
+        np.savez_compressed(dst, **{ACTION_ARRAY: action, STATE_ARRAY: state})
         converted.append(name)
         if rows is None:
             rows = action.shape[1]

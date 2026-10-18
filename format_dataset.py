@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import os
-import re
 import shutil
 import sys
 import time
@@ -21,33 +20,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# 形如 "1_frame_000318.jpg"：视频名贪婪匹配，取最后一个 "_frame_" 作分隔，
-# 这样视频名本身含下划线甚至含 "_frame_" 也能正确切分。
-FRAME_NAME_RE = re.compile(r"^(?P<video>.+)_frame_(?P<frame>\d+)\.(?:jpg|jpeg)$", re.IGNORECASE)
-
-# JPEG SOF 标记：C0-CF 里除 C4(DHT)/C8(JPG)/CC(DAC) 之外都是帧头，携带宽高
-SOF_MARKERS = frozenset(
-    {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+from pipeline_common import (
+    BLUR_SCORES_FILENAME,
+    DEFAULT_CAMERA,
+    EPISODES_JSONL,
+    FPS_ORIGIN_INFERRED,
+    FPS_ORIGIN_NOMINAL,
+    FPS_ORIGIN_RECORDED,
+    FRAMES_JSONL,
+    IMAGES_META_FILENAME,
+    INFO_JSON,
+    META_DIRNAME,
+    METADATA_PREFIX,
+    TASKS_JSONL,
+    EpisodeRow,
+    FrameRow,
+    has_eoi,
+    is_blurry,
+    natural_key,
+    parse_frame_name,
+    probe_jpeg,
+    read_blur_scores,
+    setup_logging,
+    write_json,
+    write_jsonl,
 )
-# 无长度字段的独立标记：TEM / RST0-7 / SOI / EOI
-STANDALONE_MARKERS = frozenset({0x01, 0xD8, 0xD9, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7})
 
 # Windows 传统 MAX_PATH 上限；超出时部分 API 会莫名失败，提前告警
 WINDOWS_PATH_WARN_LENGTH = 250
-
-DEFAULT_CAMERA = "front"
-
-# clean_video.py 写在图片目录里的处理参数与原始帧率记录。
-IMAGES_META_FILENAME = "_meta.json"
-# clean_video.py 写的每帧模糊分数。
-BLUR_SCORES_FILENAME = "_scores.jsonl"
-# 输入目录里以下划线开头的文件都是上游的元数据，不是帧图片。
-METADATA_PREFIX = "_"
-
-# 原始帧率的三种来源，会写进 info.json / README，方便判断 timestamp 可不可信。
-FPS_ORIGIN_RECORDED = "_meta.json"           # 精确
-FPS_ORIGIN_INFERRED = "inferred_from_frame_gaps"  # 近似，误差约 ±fps/2
-FPS_ORIGIN_NOMINAL = "nominal"               # 兜底，时间轴会偏小
 
 
 @dataclass
@@ -94,83 +94,6 @@ class Counters:
     copied: int = 0
     linked: int = 0
     already_present: int = 0
-
-
-def natural_key(text: str) -> List[object]:
-    """自然排序键：让 "2" 排在 "10" 前面，而不是按字典序倒过来。"""
-    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", text)]
-
-
-def parse_frame_name(path: Path) -> Optional[Tuple[str, int]]:
-    """从文件名解析出 (视频名, 原始帧号)；不匹配返回 None。"""
-    match = FRAME_NAME_RE.match(path.name)
-    if match is None:
-        return None
-    return match.group("video"), int(match.group("frame"))
-
-
-def probe_jpeg(path: Path) -> Optional[Tuple[int, int]]:
-    """只读 JPEG 头部，返回 (width, height)。
-
-    顺带充当完整性校验：结构不对（缺 SOI、段长非法、SOS 前无 SOF）返回 None，
-    调用方据此跳过并计入损坏帧。
-    """
-    try:
-        with path.open("rb") as handle:
-            if handle.read(2) != b"\xff\xd8":
-                return None  # 缺 SOI
-
-            while True:
-                marker = handle.read(2)
-                if len(marker) < 2 or marker[0] != 0xFF:
-                    return None
-
-                code = marker[1]
-                # 允许 FF FF ... xx 形式的填充字节
-                while code == 0xFF:
-                    extra = handle.read(1)
-                    if not extra:
-                        return None
-                    code = extra[0]
-
-                if code == 0xDA or code == 0xD9:
-                    return None  # 遇到 SOS/EOI 还没见到 SOF，说明不是常规 JPEG
-                if code in STANDALONE_MARKERS:
-                    continue
-
-                length_bytes = handle.read(2)
-                if len(length_bytes) < 2:
-                    return None
-                segment_length = int.from_bytes(length_bytes, "big")
-                if segment_length < 2:
-                    return None
-
-                if code in SOF_MARKERS:
-                    body = handle.read(5)  # 精度(1) + 高(2) + 宽(2)
-                    if len(body) < 5:
-                        return None
-                    height = int.from_bytes(body[1:3], "big")
-                    width = int.from_bytes(body[3:5], "big")
-                    if width <= 0 or height <= 0:
-                        return None
-                    return width, height
-
-                handle.seek(segment_length - 2, os.SEEK_CUR)
-    except OSError:
-        return None
-
-
-def has_eoi(path: Path) -> bool:
-    """检查文件末尾是否有 JPEG 结束标记 EOI（FFD9）。"""
-    try:
-        size = path.stat().st_size
-        if size < 4:
-            return False
-        with path.open("rb") as handle:
-            handle.seek(-2, os.SEEK_END)
-            return handle.read(2) == b"\xff\xd9"
-    except OSError:
-        return False
 
 
 def load_images_meta(input_dir: Path) -> dict:
@@ -224,25 +147,7 @@ def load_blur_scores(input_dir: Path) -> Dict[str, Dict[int, float]]:
         )
         return {}
 
-    result: Dict[str, Dict[int, float]] = defaultdict(dict)
-    try:
-        text = scores_path.read_text(encoding="utf-8")
-    except OSError:
-        logger.warning("%s 读取失败，忽略", scores_path)
-        return {}
-
-    for lineno, line in enumerate(text.splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-            score = row["blur_score"]
-            if isinstance(score, bool) or not isinstance(score, (int, float)):
-                raise ValueError("blur_score 不是数字")
-            result[str(row["video"])][int(row["source_frame"])] = float(score)
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-            logger.warning("跳过 %s 第 %d 行（%s）", scores_path, lineno, exc)
-
+    result = read_blur_scores(scores_path, logger)
     logger.info(
         "已读取 %s（%d 个视频、%d 帧的模糊分数）",
         scores_path,
@@ -250,16 +155,6 @@ def load_blur_scores(input_dir: Path) -> Dict[str, Dict[int, float]]:
         sum(len(v) for v in result.values()),
     )
     return result
-
-
-def is_blurry(score: float, threshold: float) -> bool:
-    """分数低于阈值判为模糊（严格小于：等于阈值算清晰）。
-
-    口径必须和 clean_video.is_frame_blurry()、calibrate_blur.filter_rate() 一致。
-    三处各留一份是有意的 —— 本模块刻意只依赖标准库，不能 import clean_video
-    （会连带拉起 cv2 和 tqdm）。
-    """
-    return score < threshold
 
 
 def infer_frame_step(frames: List[FrameEntry]) -> Optional[int]:
@@ -501,18 +396,6 @@ def materialize(
     else:
         counters.linked += 1
     return mode
-
-
-def write_json(path: Path, payload: dict) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=False)
-        handle.write("\n")
-
-
-def write_jsonl(path: Path, rows: List[dict]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def episode_chunk(episode_index: int, chunks_size: int) -> int:
@@ -799,13 +682,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-
 def main() -> int:
     args = parse_args()
     logger = logging.getLogger("format_dataset")
@@ -824,7 +700,7 @@ def main() -> int:
         logger.error("输入目录不存在或不是目录：%s", input_dir)
         return 1
 
-    info_path = output_dir / "meta" / "info.json"
+    info_path = output_dir / META_DIRNAME / INFO_JSON
     if info_path.exists() and not args.force and not args.dry_run:
         logger.error("输出目录已存在数据集（%s）。如需重新生成，请加 --force", info_path)
         return 1
@@ -912,7 +788,7 @@ def main() -> int:
     # ---- 建目录 ----
     try:
         data_dir = output_dir / "data"
-        meta_dir = output_dir / "meta"
+        meta_dir = output_dir / META_DIRNAME
         videos_dir = output_dir / "videos"
         for directory in (data_dir, meta_dir, videos_dir):
             directory.mkdir(parents=True, exist_ok=True)
@@ -933,8 +809,8 @@ def main() -> int:
 
     # ---- 落盘 + 收集元信息 ----
     dims: Counter = Counter()
-    episode_rows: List[dict] = []
-    frame_rows: List[dict] = []
+    episode_rows: List[EpisodeRow] = []
+    frame_rows: List[FrameRow] = []
     global_index = 0
     dumped = 0
     path_warned = False
@@ -1041,10 +917,10 @@ def main() -> int:
             info_path,
             build_info_json(args, camera_key, episodes, dims, len(frame_rows)),
         )
-        write_jsonl(meta_dir / "episodes.jsonl", episode_rows)
-        write_jsonl(meta_dir / "frames.jsonl", frame_rows)
+        write_jsonl(meta_dir / EPISODES_JSONL, episode_rows)
+        write_jsonl(meta_dir / FRAMES_JSONL, frame_rows)
         # 没有任务标注，仍然生成空文件以保住结构
-        write_jsonl(meta_dir / "tasks.jsonl", [])
+        write_jsonl(meta_dir / TASKS_JSONL, [])
         (meta_dir / "README.md").write_text(
             build_readme(args, camera_key, counters, episodes), encoding="utf-8"
         )

@@ -13,11 +13,15 @@ import time
 import cv2
 from tqdm import tqdm
 
-
-# 处理参数与原始帧率的落盘文件名，写在图片目录里，供 format_dataset.py 读取。
-IMAGES_META_FILENAME = "_meta.json"
-# 每帧模糊分数的落盘文件名，同样供 format_dataset.py 读取。
-BLUR_SCORES_FILENAME = "_scores.jsonl"
+from pipeline_common import (
+    BLUR_SCORES_FILENAME,
+    IMAGES_META_FILENAME,
+    atomic_write_json,
+    frame_filename,
+    is_blurry,
+    setup_logging,
+    video_output_prefix,
+)
 
 
 def list_videos(input_dir: Path) -> Iterable[Path]:
@@ -30,19 +34,6 @@ def list_videos(input_dir: Path) -> Iterable[Path]:
     for p in input_dir.rglob("*"):
         if p.is_file() and p.suffix.lower() == ".mp4":
             yield p
-
-
-def video_output_prefix(video_path: Path, input_dir: Path) -> str:
-    """算出该视频的输出名前缀（图片文件名和 _meta.json 的键都用它）。
-
-    规则：相对 input_dir 的路径去掉后缀，路径分隔符换成下划线。平铺目录下
-    结果就是原来的 stem；子目录下带上目录名，避免同名视频互相覆盖。
-    """
-    try:
-        relative = video_path.relative_to(input_dir)
-    except ValueError:
-        return video_path.stem  # 不在输入目录下（理论上不会发生）
-    return "_".join(relative.with_suffix("").parts)
 
 
 def assign_output_names(videos: Iterable[Path], input_dir: Path) -> Dict[Path, str]:
@@ -76,8 +67,8 @@ def blur_score(frame) -> float:
 
 
 def is_frame_blurry(frame, threshold: float) -> bool:
-    # blur_score 已转成内置 float，比较结果就是内置 bool
-    return blur_score(frame) < threshold
+    # 阈值口径由 pipeline_common.is_blurry 单点定义；这里只负责先从画面上算分。
+    return is_blurry(blur_score(frame), threshold)
 
 
 def median_score(scores: Sequence[Tuple[int, float]]) -> float:
@@ -93,8 +84,7 @@ def median_score(scores: Sequence[Tuple[int, float]]) -> float:
 
 def save_frame(frame, out_dir: Path, video_name: str, frame_number: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"{video_name}_frame_{frame_number:06d}.jpg"
-    out_path = out_dir / fname
+    out_path = out_dir / frame_filename(video_name, frame_number)
     cv2.imwrite(str(out_path), frame)
     return out_path
 
@@ -211,27 +201,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-
-def _atomic_write_json(path: Path, payload: dict) -> bool:
-    """先写临时文件再替换，避免中途崩溃留下半截 JSON。成功返回 True。"""
-    tmp_path = path.parent / (path.name + ".tmp")
-    try:
-        tmp_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-        )
-        os.replace(tmp_path, path)
-    except OSError:
-        logging.getLogger("clean_video").exception("写入 %s 失败", path)
-        return False
-    return True
-
-
 def write_images_meta(
     out_images_dir: Path,
     fps_by_video: Dict[str, float],
@@ -287,7 +256,7 @@ def write_images_meta(
         }
     )
 
-    if _atomic_write_json(meta_path, payload):
+    if atomic_write_json(meta_path, payload, logger):
         logger.info("已写入 %s（累计 %d 个视频的原始帧率）", meta_path, len(videos))
 
 

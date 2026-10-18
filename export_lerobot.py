@@ -23,31 +23,24 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-import format_dataset  # 复用 JPEG 头部解析：纯标准库，import 很轻
-
-# format_dataset.py 写在 dataset/meta/ 下的文件名
-FRAMES_JSONL = "frames.jsonl"
-EPISODES_JSONL = "episodes.jsonl"
-INFO_JSON = "info.json"
-
-DEFAULT_REPO_ID = "local/embodied-videos"
-DEFAULT_CAMERA = "front"
-
-# 自定义特征：原始视频里的帧号，将来 join 动作数据要靠它。
-# shape 声明成 (1,)：lerobot 会映射成标量列，喂的时候要传长度 1 的数组。
-SOURCE_FRAME_KEY = "source_frame"
-# 自定义特征：该帧的 Laplacian 方差，由 clean_video.py 算出。
-# 只写原始分数，不写「是否模糊」的布尔量 —— 阈值由下游自己定。
-BLUR_SCORE_KEY = "blur_score"
-
-# 动作侧车（import_actions.py 产出）。目录存在就带上动作特征，不存在就不带 ——
-# 「有没有动作」是事实而不是选项，所以不做成命令行开关。
-ACTIONS_DIRNAME = "actions"
-ACTION_KEY = "action"
-STATE_KEY = "observation.state"
-ACTION_ARRAY = "action"  # npz 里的两个数组名
-STATE_ARRAY = "state"
-
+from pipeline_common import (
+    ACTIONS_DIRNAME,
+    ACTION_ARRAY,
+    ACTION_KEY,
+    BLUR_SCORE_KEY,
+    DEFAULT_CAMERA,
+    DEFAULT_REPO_ID,
+    EPISODES_JSONL,
+    FRAMES_JSONL,
+    INFO_JSON,
+    META_DIRNAME,
+    SOURCE_FRAME_KEY,
+    STATE_ARRAY,
+    STATE_KEY,
+    probe_jpeg,
+    read_jsonl,
+    setup_logging,
+)
 
 @dataclass
 class EpisodeFrames:
@@ -59,23 +52,8 @@ class EpisodeFrames:
     frames: List[dict]
 
 
-def load_jsonl(path: Path) -> List[dict]:
-    """读一个 jsonl 文件；不存在或内容非法时抛 ValueError。"""
-    if not path.is_file():
-        raise ValueError(f"缺少文件：{path}（请先跑 format_dataset.py）")
-    rows: List[dict] = []
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            rows.append(json.loads(line))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{path} 第 {line_no} 行不是合法 JSON：{exc}") from exc
-    return rows
-
-
 def load_info(dataset_dir: Path) -> dict:
-    path = dataset_dir / "meta" / INFO_JSON
+    path = dataset_dir / META_DIRNAME / INFO_JSON
     if not path.is_file():
         raise ValueError(f"缺少文件：{path}（请先跑 format_dataset.py）")
     try:
@@ -189,7 +167,7 @@ def load_actions(dataset_dir: Path) -> Optional[Dict[str, Tuple[np.ndarray, np.n
     目录不存在就返回 None，表示这个数据集不带动作、一切照旧。文件名（去掉后缀）
     就是帧清单里的 `source_video`，所以取动作是一次字典查找，不做步长算术。
     """
-    actions_dir = dataset_dir / "meta" / ACTIONS_DIRNAME
+    actions_dir = dataset_dir / META_DIRNAME / ACTIONS_DIRNAME
     if not actions_dir.is_dir():
         return None
 
@@ -290,7 +268,7 @@ def precheck_frames(
             if not path.is_file():
                 problems.append(f"帧文件不存在：{path}")
                 continue
-            size = format_dataset.probe_jpeg(path)
+            size = probe_jpeg(path)
             if size is None:
                 problems.append(f"JPEG 无法解析（损坏？）：{path}")
             elif size != (width, height):
@@ -555,13 +533,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
-
 def main() -> int:
     args = parse_args()
     logger = logging.getLogger("export_lerobot")
@@ -576,8 +547,12 @@ def main() -> int:
 
     try:
         info = load_info(dataset_dir)
-        frames = load_jsonl(dataset_dir / "meta" / FRAMES_JSONL)
-        episode_rows = load_jsonl(dataset_dir / "meta" / EPISODES_JSONL)
+        frames = read_jsonl(
+            dataset_dir / META_DIRNAME / FRAMES_JSONL, missing_hint="请先跑 format_dataset.py"
+        )
+        episode_rows = read_jsonl(
+            dataset_dir / META_DIRNAME / EPISODES_JSONL, missing_hint="请先跑 format_dataset.py"
+        )
         height, width = resolve_camera_shape(info, camera_key)
         episodes = group_episodes(frames, episode_rows)
         # 自动发现，不做成开关：「有没有动作」是事实而不是选择
