@@ -188,14 +188,16 @@ def test_full_build_produces_expected_layout(make_images, run_format, tmp_path, 
     rc, _ = build(images, out, run_format)
     assert rc == 0
 
-    assert sorted(p.name for p in out.iterdir()) == ["data", "meta", "videos"]
-    assert (out / "data" / ".gitkeep").is_file()
-    assert (out / "videos" / "chunk-000" / "observation.images.front" / "episode_000000").is_dir()
-    assert (out / "videos" / "chunk-000" / "observation.images.front" / "episode_000001").is_dir()
-
-    assert len(list((out / "videos").rglob("*.jpg"))) == 5
+    assert sorted(p.name for p in out.iterdir()) == ["meta"]
     for name in ("info.json", "episodes.jsonl", "frames.jsonl", "tasks.jsonl", "README.md"):
         assert (out / "meta" / name).is_file(), name
+
+    frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert len(frames) == 5
+    for row in frames:
+        assert not Path(row["path"]).is_absolute()
+        assert (images / row["path"]).is_file()
+    assert read_info(out)["extras"]["image_root"]
 
     # 没有任务标注，tasks.jsonl 是空文件但必须存在
     assert read_jsonl(out / "meta" / "tasks.jsonl") == []
@@ -299,16 +301,22 @@ def test_frames_keep_source_numbering_and_gaps(make_images, write_meta, run_form
     assert [f["is_blurry"] for f in frames] == [None] * 4
 
 
-def test_frames_on_disk_follow_positional_naming(make_images, run_format, tmp_path, read_jsonl):
+def test_frames_reference_original_images_without_copying(
+    make_images, run_format, tmp_path, read_jsonl
+):
     images = make_images({"1": [0, 6, 24]})
     rc, out = build(images, tmp_path / "ds", run_format)
     assert rc == 0
 
     frames = read_jsonl(out / "meta" / "frames.jsonl")
+    assert [Path(row["path"]).name for row in frames] == [
+        "1_frame_000000.jpg",
+        "1_frame_000006.jpg",
+        "1_frame_000024.jpg",
+    ]
     for row in frames:
-        path = out / row["path"]
-        assert path.is_file()
-        assert path.name == f"frame_{row['frame_index']:06d}.jpg"
+        assert (images / row["path"]).is_file()
+    assert not (out / "videos").exists()
 
 
 def test_blur_scores_carry_into_frames_jsonl(
@@ -386,35 +394,21 @@ def test_missing_scores_are_tolerated_but_warned(
     assert "没有模糊分数" in caplog.text
 
 
-def test_chunks_size_splits_episodes_across_chunks(make_images, run_format, tmp_path):
-    """episode 数超过 chunks_size 时必须分块，且路径里的 chunk 号要跟上。"""
-    images = make_images({"1": [0, 6], "2": [0, 6], "3": [0, 6]})
-    rc, out = build(images, tmp_path / "ds", run_format, "--chunks-size", 2)
-    assert rc == 0
-
-    camera = out / "videos" / "chunk-000" / "observation.images.front"
-    assert (camera / "episode_000000").is_dir()
-    assert (camera / "episode_000001").is_dir()
-    assert (out / "videos" / "chunk-001" / "observation.images.front" / "episode_000002").is_dir()
-    assert read_info(out)["total_chunks"] == 2
-
-
 def test_info_json_core_fields(make_images, run_format, tmp_path):
     images = make_images({"1": [0, 6], "2": [0, 5]})
     rc, out = build(images, tmp_path / "ds", run_format)
     assert rc == 0
 
     info = read_info(out)
-    assert info["codebase_version"] == "v2.0"
+    assert info["codebase_version"] == "v3.0-manifest"
     assert info["total_episodes"] == 2
     assert info["total_frames"] == 4
-    assert info["total_chunks"] == 1
-    assert info["chunks_size"] == 1000
     assert info["fps"] == 5
     assert info["splits"] == {"train": "0:2"}
     # 上游此处是 "video"（指向 mp4），我们存 jpg，必须标成 "image"
     assert info["features"]["observation.images.front"]["dtype"] == "image"
     assert info["features"]["observation.images.front"]["shape"][2] == 3
+    assert info["extras"]["image_root"]
 
 
 def test_warns_on_mixed_image_sizes(make_images, run_format, tmp_path, caplog):
@@ -446,9 +440,9 @@ def test_paths_stay_relative_with_absolute_output(make_images, run_format, tmp_p
 
     for row in read_jsonl(out / "meta" / "frames.jsonl"):
         assert not Path(row["path"]).is_absolute(), row["path"]
-        assert row["path"].startswith("videos/"), row["path"]
-    for row in read_jsonl(out / "meta" / "episodes.jsonl"):
-        assert not Path(row["frame_dir"]).is_absolute(), row["frame_dir"]
+        assert (images / row["path"]).is_file(), row["path"]
+    info = read_info(out)
+    assert not Path(info["extras"]["image_root"]).is_absolute()
 
 
 def test_fps_prefers_meta_file(make_images, write_meta, run_format, tmp_path):
@@ -556,16 +550,13 @@ def test_refuses_to_overwrite_without_force(make_images, run_format, tmp_path):
     assert build(images, out, run_format)[0] == 1     # 第二次拒绝
 
 
-def test_force_rerun_reuses_existing_files(make_images, run_format, tmp_path, caplog):
+def test_force_rerun_rewrites_manifest(make_images, run_format, tmp_path, read_jsonl):
     images = make_images({"1": [0, 6]})
     out = tmp_path / "ds"
     assert build(images, out, run_format)[0] == 0
-    with caplog.at_level(logging.INFO):
-        rc, _ = build(images, out, run_format, "--force")
+    rc, _ = build(images, out, run_format, "--force")
     assert rc == 0
-    assert "已存在=2" in caplog.text
-    assert "链接=0" in caplog.text
-    assert "复制=0" in caplog.text
+    assert len(read_jsonl(out / "meta" / "frames.jsonl")) == 2
 
 
 def test_dry_run_creates_nothing(make_images, run_format, tmp_path):
@@ -585,41 +576,9 @@ def test_missing_input_directory_fails(tmp_path, run_format):
     assert build(tmp_path / "nope", tmp_path / "ds", run_format)[0] == 1
 
 
-def test_invalid_chunks_size_fails(make_images, run_format, tmp_path):
-    images = make_images({"1": [0, 6]})
-    assert build(images, tmp_path / "ds", run_format, "--chunks-size", 0)[0] == 1
-
-
-# --------------------------------------------------------------------------
-# 落盘方式
-# --------------------------------------------------------------------------
-
-
-def test_copy_mode_creates_independent_files(make_images, run_format, tmp_path):
+def test_images_are_not_copied_into_manifest_dir(make_images, run_format, tmp_path):
     images = make_images({"1": [0]})
-    rc, out = build(images, tmp_path / "ds", run_format, "--link-mode", "copy")
+    rc, out = build(images, tmp_path / "ds", run_format)
     assert rc == 0
-
-    produced = next((out / "videos").rglob("*.jpg"))
-    source = images / "1_frame_000000.jpg"
-    assert not produced.samefile(source)
-    assert produced.stat().st_ino != source.stat().st_ino
-
-
-def test_hardlink_mode_shares_the_same_file(make_images, run_format, tmp_path):
-    images = make_images({"1": [0]})
-    rc, out = build(images, tmp_path / "ds", run_format, "--link-mode", "hardlink")
-    assert rc == 0
-
-    produced = next((out / "videos").rglob("*.jpg"))
-    source = images / "1_frame_000000.jpg"
-    assert produced.samefile(source)
-    assert produced.stat().st_nlink == 2
-
-
-def test_auto_mode_resolves_to_a_usable_mode(make_images, run_format, tmp_path, caplog):
-    images = make_images({"1": [0]})
-    with caplog.at_level(logging.INFO):
-        rc, _ = build(images, tmp_path / "ds", run_format)
-    assert rc == 0
-    assert "链接方式自动判定为" in caplog.text
+    assert not (out / "videos").exists()
+    assert (images / "1_frame_000000.jpg").is_file()

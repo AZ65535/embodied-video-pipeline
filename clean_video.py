@@ -6,6 +6,7 @@ import math
 import os
 import statistics
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, NamedTuple, Optional, Sequence, Tuple, List
 import time
@@ -15,11 +16,17 @@ from tqdm import tqdm
 
 from pipeline_common import (
     BLUR_SCORES_FILENAME,
+    DEFAULT_CAMERA,
     IMAGES_META_FILENAME,
     atomic_write_json,
+    canonical_camera_order,
+    episode_key_for_dir,
     frame_filename,
     is_blurry,
+    load_camera_names,
+    natural_key,
     setup_logging,
+    validate_camera_name,
     video_output_prefix,
 )
 
@@ -37,23 +44,96 @@ def list_videos(input_dir: Path) -> Iterable[Path]:
 
 
 def assign_output_names(videos: Iterable[Path], input_dir: Path) -> Dict[Path, str]:
-    """给每个视频分配输出前缀；仍有重名时抛 ValueError。
-
-    带目录前缀后仍可能撞车（videos/a_1.mp4 与 videos/a/1.mp4 都得到 "a_1"）。
-    必须直接报错：并发写同名文件会静默丢帧。
-    """
+    """给每个视频分配输出前缀；大小写不敏感重名时抛 ValueError。"""
     assigned: Dict[Path, str] = {}
     owner: Dict[str, Path] = {}
     for video in videos:
         prefix = video_output_prefix(video, input_dir)
-        if prefix in owner:
+        key = prefix.casefold()
+        if key in owner:
             raise ValueError(
-                f"输出名冲突：{owner[prefix]} 与 {video} 都会写成 {prefix}_frame_*.jpg，"
+                f"输出名冲突：{owner[key]} 与 {video} 都会写成 {prefix}_frame_*.jpg，"
                 "并发写入会互相覆盖；请重命名其中一个，或调整目录结构"
             )
-        owner[prefix] = video
+        owner[key] = video
         assigned[video] = prefix
     return assigned
+
+
+@dataclass(frozen=True)
+class VideoPlan:
+    """一个 mp4 在分组后的身份。"""
+
+    path: Path
+    output_prefix: str
+    episode: str
+    episode_dir: str
+    camera: str
+    source_stem: str
+
+
+def build_video_plans(
+    videos: Sequence[Path],
+    input_dir: Path,
+    group_by: str,
+    camera: Optional[str],
+    camera_names: Dict[str, str],
+) -> List[VideoPlan]:
+    """在解码前完成分组、命名和冲突校验。"""
+    output_names = assign_output_names(videos, input_dir)
+    plans: List[VideoPlan] = []
+    episode_cameras: Dict[str, List[str]] = {}
+
+    for video in sorted(videos, key=lambda path: natural_key(str(path))):
+        prefix = output_names[video]
+        stem = video.stem
+        if group_by == "dir":
+            relative_parent = video.parent.relative_to(input_dir)
+            episode = episode_key_for_dir(relative_parent)
+            camera_name = camera_names.get(stem, stem)
+            episode_dir = relative_parent.as_posix() or "."
+        else:
+            episode = prefix
+            camera_name = camera_names.get(stem, camera or DEFAULT_CAMERA)
+            episode_dir = video.parent.relative_to(input_dir).as_posix() or "."
+        reason = validate_camera_name(camera_name)
+        if reason:
+            raise ValueError(f"{video} 的相机名 {camera_name!r} 非法：{reason}")
+        plans.append(
+            VideoPlan(
+                path=video,
+                output_prefix=prefix,
+                episode=episode,
+                episode_dir=episode_dir,
+                camera=camera_name,
+                source_stem=stem,
+            )
+        )
+        episode_cameras.setdefault(episode, []).append(camera_name)
+
+    episodes_seen: Dict[str, str] = {}
+    for plan in plans:
+        key = plan.episode.casefold()
+        if key in episodes_seen and episodes_seen[key] != plan.episode:
+            raise ValueError(
+                f"episode key 冲突：{episodes_seen[key]} 与 {plan.episode}（大小写不敏感）"
+            )
+        episodes_seen[key] = plan.episode
+        cameras = episode_cameras[plan.episode]
+        folded = [name.casefold() for name in cameras]
+        if len(set(folded)) != len(folded):
+            raise ValueError(f"{plan.episode} 的相机名有重复：{cameras}")
+
+    camera_sets = {frozenset(names) for names in episode_cameras.values()}
+    if len(camera_sets) > 1:
+        raise ValueError(
+            "不同 episode 的相机集合不一致："
+            + "; ".join(
+                f"{episode}: {sorted(names)}"
+                for episode, names in sorted(episode_cameras.items())
+            )
+        )
+    return plans
 
 
 def blur_score(frame) -> float:
@@ -198,6 +278,22 @@ def parse_args() -> argparse.Namespace:
         help="Output base directory (images will be saved to OUTPUT/images/)",
     )
     parser.add_argument("--fps", type=int, default=5, help="Target frames per second to sample")
+    parser.add_argument(
+        "--group-by",
+        choices=["file", "dir"],
+        default="file",
+        help="file = 一个 mp4 一个 episode；dir = 同目录 mp4 是同一集的多路相机（默认 file）",
+    )
+    parser.add_argument(
+        "--camera",
+        default=None,
+        help="file 模式的相机名（默认 front）；dir 模式请用 --camera-names",
+    )
+    parser.add_argument(
+        "--camera-names",
+        default=None,
+        help="可选 JSON：文件名 stem -> 相机名，例如 {\"18026681\": \"wrist\"}",
+    )
     return parser.parse_args()
 
 
@@ -206,58 +302,126 @@ def write_images_meta(
     fps_by_video: Dict[str, float],
     target_fps: int,
     results: Sequence[VideoResult],
+    plans: Optional[Sequence[VideoPlan]] = None,
+    group_by: str = "file",
+    camera_names: Optional[Dict[str, str]] = None,
+    source_root: Optional[Path] = None,
 ) -> None:
-    """把运行参数和每个视频的原始帧率写到 out_images_dir/_meta.json。
+    """写 format 3 的 _meta.json：video 条目 + episode 分组。
 
-    必须由父进程在收齐所有 future 后调一次：子进程各写各的会互相覆盖。
-    已有条目保留（支持增量追加），orig_fps 为 0 的失败视频不写入。
+    format 3 是第一步唯一支持的格式；旧格式会被忽略。相同 group_by 的重复运行
+    按当前 episode 整集替换，未涉及的 episode 保留。
 
-    format 1 → 2 的变化：删掉了 blur_threshold（阈值概念已移到 format_dataset.py），
-    删掉 saved（恒等于 sampled）和 skipped_blurry，新增 score_median。
-    跨版本增量追加时，旧版本的条目会原样保留（它们的分数没存过，median 无法补算）。
+    `plans` 省略时按 file 模式从 results 合成，便于旧调用方/测试直接使用。
     """
     logger = logging.getLogger("clean_video")
+    camera_names = camera_names or {}
+    if plans is None:
+        plans = [
+            VideoPlan(
+                path=Path(result.video_name),
+                output_prefix=result.video_name,
+                episode=result.video_name,
+                episode_dir=".",
+                camera=camera_names.get(result.video_name, DEFAULT_CAMERA),
+                source_stem=result.video_name,
+            )
+            for result in results
+        ]
     meta_path = out_images_dir / IMAGES_META_FILENAME
 
     payload: dict = {}
     if meta_path.exists():
         try:
             loaded = json.loads(meta_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                payload = loaded
         except (OSError, json.JSONDecodeError):
             logger.warning("已有的 %s 无法解析，将重新生成", meta_path)
+            loaded = None
+        if isinstance(loaded, dict) and loaded.get("format") == 3:
+            if loaded.get("group_by") != group_by:
+                raise ValueError(
+                    f"{meta_path} 的 group_by={loaded.get('group_by')!r}，"
+                    f"与本次 {group_by!r} 不一致；请换一个新的 --output"
+                )
+            payload = loaded
+        elif loaded is not None:
+            logger.warning("已有的 %s 不是 format 3，将被新格式替换", meta_path)
 
-    videos = payload.get("videos")
-    if not isinstance(videos, dict):
-        videos = {}
+    videos = payload.get("videos") if isinstance(payload.get("videos"), dict) else {}
+    episodes = payload.get("episodes") if isinstance(payload.get("episodes"), dict) else {}
+    merged_names = payload.get("camera_names") if isinstance(payload.get("camera_names"), dict) else {}
+    merged_names.update(camera_names)
 
     stats = {r.video_name: r for r in results}
-    for video_name, orig_fps in fps_by_video.items():
-        if orig_fps <= 0:
+    for plan in plans:
+        result = stats.get(plan.output_prefix)
+        recorded_fps = fps_by_video.get(
+            plan.output_prefix, result.orig_fps if result is not None else 0.0
+        )
+        if result is None or recorded_fps <= 0:
+            videos.pop(plan.output_prefix, None)
             continue
-        result = stats.get(video_name)
-        if result is None:
-            continue
-        videos[video_name] = {
-            "orig_fps": round(float(orig_fps), 6),
-            "frame_step": max(1, int(round(orig_fps / float(target_fps)))) if target_fps > 0 else 1,
+        videos[plan.output_prefix] = {
+            "orig_fps": round(float(recorded_fps), 6),
+            "frame_step": max(1, int(round(recorded_fps / float(target_fps))))
+            if target_fps > 0
+            else 1,
             "sampled": result.sampled,
             "score_median": round(median_score(result.scores), 4),
             "elapsed": round(result.elapsed, 3),
+            "source_stem": plan.source_stem,
+            "episode": plan.episode,
+            "camera": plan.camera,
         }
+
+    touched = {plan.episode for plan in plans}
+    for episode in touched:
+        plans_for_episode = [plan for plan in plans if plan.episode == episode]
+        episodes[episode] = {
+            "episode_dir": plans_for_episode[0].episode_dir,
+            "cameras": {plan.camera: plan.output_prefix for plan in plans_for_episode},
+        }
+
+    camera_sets = {
+        frozenset(info.get("cameras", {}))
+        for info in episodes.values()
+        if isinstance(info, dict)
+    }
+    if len(camera_sets) > 1:
+        raise ValueError(
+            "合并后的 _meta.json 中 episode 相机集合不一致："
+            + "; ".join(
+                f"{episode}: {sorted(info.get('cameras', {}))}"
+                for episode, info in sorted(episodes.items())
+                if isinstance(info, dict)
+            )
+        )
+    cameras = canonical_camera_order(next(iter(camera_sets))) if camera_sets else []
 
     payload.update(
         {
-            "format": 2,
+            "format": 3,
             "tool": "clean_video.py",
             "target_fps": target_fps,
+            "group_by": group_by,
+            "source_root": (
+                str(source_root.resolve()) if source_root else payload.get("source_root")
+            ),
+            "cameras": cameras,
+            "camera_names": merged_names,
+            "episodes": episodes,
             "videos": videos,
         }
     )
 
     if atomic_write_json(meta_path, payload, logger):
-        logger.info("已写入 %s（累计 %d 个视频的原始帧率）", meta_path, len(videos))
+        logger.info(
+            "已写入 %s（%d 个 episode，%d 个视频，%d 路相机）",
+            meta_path,
+            len(episodes),
+            len(videos),
+            len(cameras),
+        )
 
 
 def write_blur_scores(out_images_dir: Path, results: Sequence[VideoResult]) -> None:
@@ -341,22 +505,34 @@ def main() -> int:
         logger.info("No MP4 videos found in %s", input_dir)
         return 0
 
+    if args.group_by == "dir" and args.camera is not None:
+        logger.error("--group-by dir 不能同时传 --camera；相机名请用 --camera-names 或文件名")
+        return 1
+
     try:
-        output_names = assign_output_names(videos, input_dir)
+        camera_names = load_camera_names(
+            Path(args.camera_names) if args.camera_names else None
+        )
+        plans = build_video_plans(
+            videos, input_dir, args.group_by, args.camera, camera_names
+        )
     except ValueError as exc:
         logger.error("%s", exc)
         return 1
 
-    nested = [vid for vid in videos if output_names[vid] != vid.stem]
+    nested = [plan for plan in plans if plan.output_prefix != plan.path.stem]
     if nested:
         logger.info(
             "有 %d 个视频位于子目录，输出名前缀带上了目录：%s",
             len(nested),
-            ", ".join(f"{vid.name} -> {output_names[vid]}" for vid in nested[:5]),
+            ", ".join(
+                f"{plan.path.name} -> {plan.output_prefix}" for plan in nested[:5]
+            ),
         )
 
     total_sampled = 0
     results: List[VideoResult] = []
+    results_by_prefix: Dict[str, VideoResult] = {}
     fps_by_video: Dict[str, float] = {}
 
     start_all = time.time()
@@ -364,22 +540,23 @@ def main() -> int:
         future_map = {
             executor.submit(
                 process_video_worker,
-                str(vid),
+                str(plan.path),
                 str(out_images_dir),
                 args.fps,
-                output_names[vid],
-            ): vid
-            for vid in videos
+                plan.output_prefix,
+            ): plan
+            for plan in plans
         }
 
         for fut in concurrent.futures.as_completed(future_map):
-            vid = future_map[fut]
+            plan = future_map[fut]
             try:
                 result = fut.result()
             except Exception:
-                logger.exception("Processing failed for %s", vid)
+                logger.exception("Processing failed for %s", plan.path)
                 continue
 
+            results_by_prefix[plan.output_prefix] = result
             if result.orig_fps > 0:
                 fps_by_video[result.video_name] = result.orig_fps
             results.append(result)
@@ -393,6 +570,19 @@ def main() -> int:
             )
 
     total_elapsed = time.time() - start_all
+
+    bad_episodes = set()
+    if args.group_by == "dir":
+        for plan in plans:
+            result = results_by_prefix.get(plan.output_prefix)
+            if result is None or result.orig_fps <= 0:
+                bad_episodes.add(plan.episode)
+                logger.error(
+                    "episode %s 的相机 %s 处理失败，整集不可用",
+                    plan.episode,
+                    plan.camera,
+                )
+    plans_for_meta = [plan for plan in plans if plan.episode not in bad_episodes]
 
     # 报中位数而不是「过滤率」：中位数不需要阈值就能看出素材有多模糊
     logger.info("\n=== Benchmark Results ===")
@@ -408,9 +598,22 @@ def main() -> int:
 
     logger.info("Totals: sampled=%d total_time=%.2fs", total_sampled, total_elapsed)
 
-    write_images_meta(out_images_dir, fps_by_video, args.fps, results)
+    try:
+        write_images_meta(
+            out_images_dir,
+            fps_by_video,
+            args.fps,
+            results,
+            plans_for_meta,
+            args.group_by,
+            camera_names,
+            input_dir,
+        )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
     write_blur_scores(out_images_dir, results)
-    return 0
+    return 1 if bad_episodes else 0
 
 
 def process_video_worker(

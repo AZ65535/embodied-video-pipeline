@@ -57,8 +57,6 @@ def test_cli_options_are_forwarded(tmp_path):
         "150",
         "--max-episode-seconds",
         "0",
-        "--link-mode",
-        "copy",
         "--camera",
         "wrist",
         "--task",
@@ -69,17 +67,57 @@ def test_cli_options_are_forwarded(tmp_path):
         "local/x",
         "--force",
     )
-    fmt, exp = steps[1].cmd, steps[2].cmd
+    clean, fmt, exp = steps[0].cmd, steps[1].cmd, steps[2].cmd
 
+    assert value_after(clean, "--camera") == "wrist"
     assert value_after(fmt, "--blur-threshold") == "150.0"
     assert value_after(fmt, "--max-episode-seconds") == "0.0"
-    assert value_after(fmt, "--link-mode") == "copy"
     assert value_after(fmt, "--camera") == "wrist"
     assert "--force" in fmt and "--force" in exp
     assert value_after(exp, "--camera") == "wrist"
     assert value_after(exp, "--task") == "pick"
     assert value_after(exp, "--vcodec") == "h264"
     assert value_after(exp, "--repo-id") == "local/x"
+
+
+def test_dir_mode_forwards_group_by_and_ignores_camera(tmp_path):
+    args, steps = steps_for(
+        tmp_path, "--group-by", "dir", "--camera", "front"
+    )
+    assert value_after(steps[0].cmd, "--group-by") == "dir"
+    assert value_after(steps[1].cmd, "--group-by") == "dir"
+    assert "--camera" not in steps[1].cmd
+    assert "--camera" not in steps[2].cmd
+
+
+def test_camera_names_is_forwarded_to_steps_1_and_2(tmp_path):
+    names = tmp_path / "names.json"
+    names.write_text("{}", encoding="utf-8")
+    _, steps = steps_for(
+        tmp_path, "--group-by", "dir", "--camera-names", str(names)
+    )
+    expected = str(names.resolve())
+    assert value_after(steps[0].cmd, "--camera-names") == expected
+    assert value_after(steps[1].cmd, "--camera-names") == expected
+    assert "--camera-names" not in steps[2].cmd
+
+
+def test_dataset_id_and_robot_type_go_to_step_3_only(tmp_path):
+    _, steps = steps_for(
+        tmp_path, "--dataset-id", "droid_autolab", "--robot-type", "droid"
+    )
+    assert value_after(steps[2].cmd, "--dataset-id") == "droid_autolab"
+    assert value_after(steps[2].cmd, "--robot-type") == "droid"
+    for step in steps[:2]:
+        assert "--dataset-id" not in step.cmd
+        assert "--robot-type" not in step.cmd
+
+
+def test_step_3_requires_manifest_as_done_marker(tmp_path):
+    _, steps = steps_for(tmp_path)
+    names = [path.name for path in steps[2].done_markers]
+    assert "info.json" in names
+    assert "dataset_manifest.json" in names
 
 
 def test_skip_existing_skips_completed_steps(tmp_path):

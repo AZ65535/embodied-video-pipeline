@@ -24,6 +24,7 @@
     python import_actions.py --format droid --input videos --dataset dataset
 """
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -37,8 +38,10 @@ from pipeline_common import (
     ACTIONS_DIRNAME,
     ACTION_ARRAY,
     EPISODES_JSONL,
+    INFO_JSON,
     META_DIRNAME,
     STATE_ARRAY,
+    episode_key_for_dir,
     read_jsonl,
     setup_logging,
     video_output_prefix,
@@ -87,15 +90,44 @@ def load_droid(action_file: Path) -> Tuple[np.ndarray, np.ndarray]:
 #
 # DROID 的目录约定：trajectory.h5 与各相机的 mp4 同目录（都在 episode 目录下）。
 # 按**实际文件**配对，而不是拿扁平化的名字去猜，避免 a/b_c 与 a_b/c 这类撞名。
-def find_droid_sources(input_dir: Path) -> Dict[str, Path]:
-    """扫出「源视频前缀 → trajectory.h5」。前缀规则必须与 clean_video.py 一致。"""
+def find_droid_sources(
+    input_dir: Path, group_by: str = "file"
+) -> Dict[str, Path]:
+    """扫出「动作侧车键 → trajectory.h5」。
+
+    file 模式每个视频一个键（与 clean_video 的源视频前缀一致）；dir 模式每个
+    含 mp4 的目录一个键（与 format_dataset 的 episode 键一致）。
+    """
     sources: Dict[str, Path] = {}
-    for video in sorted(input_dir.rglob("*")):
-        if not video.is_file() or video.suffix.lower() != ".mp4":
+    if group_by == "file":
+        for video in sorted(input_dir.rglob("*")):
+            if not video.is_file() or video.suffix.lower() != ".mp4":
+                continue
+            action_file = video.parent / "trajectory.h5"
+            if action_file.is_file():
+                sources[video_output_prefix(video, input_dir)] = action_file
+        return sources
+
+    for action_file in sorted(input_dir.rglob("trajectory.h5")):
+        if not action_file.is_file():
             continue
-        action_file = video.parent / "trajectory.h5"
-        if action_file.is_file():
-            sources[video_output_prefix(video, input_dir)] = action_file
+        parent = action_file.parent
+        if not any(
+            path.is_file() and path.suffix.lower() == ".mp4"
+            for path in parent.iterdir()
+        ):
+            continue
+        try:
+            relative = parent.relative_to(input_dir)
+        except ValueError:
+            relative = Path(parent.name)
+        key = episode_key_for_dir(relative)
+        if key in sources:
+            raise ValueError(
+                f"目录 {relative} 与 {sources[key].parent} 映射到同一个 episode 键 "
+                f"{key!r}；请重命名目录后重试"
+            )
+        sources[key] = action_file
     return sources
 
 
@@ -113,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         default="droid",
         choices=sorted(SOURCES),
         help="动作记录的格式（决定怎么从素材目录里找到它；默认 droid）",
+    )
+    parser.add_argument(
+        "--group-by",
+        choices=("file", "dir"),
+        default="file",
+        help="与 clean_video.py 一致：file=每个视频一集，dir=同目录多相机属于一集（默认 file）",
     )
     parser.add_argument(
         "--input", "-i", required=True,
@@ -146,16 +184,46 @@ def main() -> int:
         logger.error("%s", exc)
         return 1
 
-    # 以帧清单为准：它才是第三步真正会读的源视频集合
+    info_path = dataset_dir / META_DIRNAME / INFO_JSON
+    if info_path.is_file():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.error("读不了 %s：%s", info_path, exc)
+            return 1
+        extras = info.get("extras") if isinstance(info, dict) else None
+        recorded = extras.get("group_by") if isinstance(extras, dict) else None
+        if recorded and recorded != args.group_by:
+            logger.error(
+                "数据集是按 --group-by %s 生成的，本次却传了 %s；"
+                "请改用 --group-by %s",
+                recorded,
+                args.group_by,
+                recorded,
+            )
+            return 1
+
+    # 以帧清单为准：它才是第三步真正会读的 episode 集合。
+    # 新清单用 episode 作权威键；旧清单没有 episode 字段时回退 source_video。
     wanted: List[str] = []
     for row in episodes:
-        name = str(row.get("source_video", ""))
-        if name and name not in wanted:
+        name = row.get("episode")
+        if not isinstance(name, str) or not name:
+            name = row.get("source_video")
+        if isinstance(name, str) and name and name not in wanted:
             wanted.append(name)
     wanted.sort()
 
-    logger.info("帧清单里有 %d 个源视频，正在素材目录里找 %s 格式的动作记录…", len(wanted), args.format)
-    sources = SOURCES[args.format](input_dir)
+    logger.info(
+        "帧清单里有 %d 个 episode，正在素材目录里找 %s 格式的动作记录…",
+        len(wanted),
+        args.format,
+    )
+    try:
+        sources = SOURCES[args.format](input_dir, args.group_by)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
 
     out_dir = dataset_dir / META_DIRNAME / ACTIONS_DIRNAME
     out_dir.mkdir(parents=True, exist_ok=True)

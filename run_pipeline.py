@@ -29,6 +29,7 @@ from pipeline_common import (
     DEFAULT_REPO_ID,
     IMAGES_META_FILENAME,
     INFO_JSON,
+    MANIFEST_FILENAME,
     META_DIRNAME,
 )
 
@@ -85,7 +86,13 @@ def build_steps(
         str(output_base),
         "--fps",
         str(args.fps),
+        "--group-by",
+        args.group_by,
     ]
+    if args.camera_names is not None:
+        clean_cmd += ["--camera-names", str(resolve_path(args.camera_names))]
+    if args.camera is not None and args.group_by == "file":
+        clean_cmd += ["--camera", args.camera]
 
     format_cmd = [
         python,
@@ -96,14 +103,16 @@ def build_steps(
         str(dataset_dir),
         "--fps",
         str(args.fps),
+        "--group-by",
+        args.group_by,
     ]
+    if args.camera_names is not None:
+        format_cmd += ["--camera-names", str(resolve_path(args.camera_names))]
     if args.blur_threshold is not None:
         format_cmd += ["--blur-threshold", str(args.blur_threshold)]
     if args.max_episode_seconds is not None:
         format_cmd += ["--max-episode-seconds", str(args.max_episode_seconds)]
-    if args.link_mode is not None:
-        format_cmd += ["--link-mode", args.link_mode]
-    if args.camera is not None:
+    if args.camera is not None and args.group_by == "file":
         format_cmd += ["--camera", args.camera]
     if args.force:
         format_cmd.append("--force")
@@ -119,12 +128,16 @@ def build_steps(
         args.repo_id,
     ]
     # 不传 --fps：第三步沿用第二步 info.json 里的值，避免两者不一致。
-    if args.camera is not None:
+    if args.camera is not None and args.group_by == "file":
         export_cmd += ["--camera", args.camera]
     if args.task is not None:
         export_cmd += ["--task", args.task]
     if args.vcodec is not None:
         export_cmd += ["--vcodec", args.vcodec]
+    if args.dataset_id is not None:
+        export_cmd += ["--dataset-id", args.dataset_id]
+    if args.robot_type is not None:
+        export_cmd += ["--robot-type", args.robot_type]
     if args.force:
         export_cmd.append("--force")
 
@@ -150,7 +163,10 @@ def build_steps(
             number=3,
             title="导出 LeRobot 数据集",
             cmd=export_cmd,
-            done_markers=(lerobot_dir / META_DIRNAME / INFO_JSON,),
+            done_markers=(
+                lerobot_dir / META_DIRNAME / INFO_JSON,
+                lerobot_dir / MANIFEST_FILENAME,
+            ),
             forceable=True,
         ),
     ]
@@ -224,13 +240,20 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="episode 时长上限，0 = 不切（默认沿用第二步的 60）",
     )
     parser.add_argument(
-        "--link-mode",
-        choices=["auto", "hardlink", "symlink", "copy"],
-        default=None,
-        help="帧图片落盘方式（默认 auto：硬链接 → 软链接 → 复制）",
+        "--group-by",
+        choices=("file", "dir"),
+        default="file",
+        help="file=每个 mp4 一集；dir=同目录的 mp4 是同集多相机（默认 file）",
     )
     parser.add_argument(
-        "--camera", default=None, help="相机名，生成 observation.images.<camera>（默认 front）"
+        "--camera-names",
+        default=None,
+        help="相机名映射 JSON（仅 dir 模式；filename stem -> camera name）",
+    )
+    parser.add_argument(
+        "--camera",
+        default=None,
+        help="单相机模式下的相机名（file 模式；默认 front）",
     )
     parser.add_argument("--task", default=None, help="每帧任务标注（默认空串，表示没有标注）")
     parser.add_argument(
@@ -238,6 +261,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo-id", default=DEFAULT_REPO_ID, help=f"数据集标识（默认 {DEFAULT_REPO_ID}）"
+    )
+    parser.add_argument(
+        "--dataset-id",
+        default=None,
+        help="数据集稳定逻辑 ID（默认用 repo_id；多数据集场景建议显式指定）",
+    )
+    parser.add_argument(
+        "--robot-type", default=None, help="机器人类型（写入 manifest 与 lerobot info）"
     )
 
     group = parser.add_mutually_exclusive_group()
@@ -267,6 +298,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     input_dir = resolve_path(args.input)
     if not input_dir.is_dir():
         print(f"输入目录不存在：{input_dir}", file=sys.stderr)
+        return 1
+    if args.group_by == "dir" and args.camera is not None:
+        print(
+            "提示：--group-by dir 时相机名来自文件名/--camera-names，"
+            "--camera 被忽略。",
+            file=sys.stderr,
+        )
+    if args.camera_names is not None and not resolve_path(args.camera_names).is_file():
+        print(f"相机名映射不存在：{resolve_path(args.camera_names)}", file=sys.stderr)
         return 1
 
     output_base = resolve_path(args.output)

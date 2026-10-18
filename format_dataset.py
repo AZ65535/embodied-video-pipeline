@@ -1,10 +1,9 @@
 #!/usr/bin/env python
-"""把 clean_video.py 抽出的清晰帧整理成帧清单（中间产物）。
+"""把 clean_video.py 抽出的帧整理成清单（中间产物）。
 
-管线第二步，产物 dataset/ 供 export_lerobot.py 消费。仅依赖 Python 标准库
+管线第二步，产物 `dataset/meta/` 供 export_lerobot.py 消费。帧图片仍留在第一步的
+`output/images/`，本脚本只写清单和路径，不复制/链接图片。仅依赖 Python 标准库
 （未引入 pyarrow / lerobot / 任何图像库）。
-
-与上游 LeRobot 的差异、以及本脚本做不到的事情，见生成出来的 meta/README.md。
 """
 
 import argparse
@@ -12,7 +11,6 @@ import json
 import logging
 import math
 import os
-import shutil
 import sys
 import time
 from collections import Counter, defaultdict
@@ -35,20 +33,20 @@ from pipeline_common import (
     TASKS_JSONL,
     EpisodeRow,
     FrameRow,
+    camera_key,
+    canonical_camera_order,
     has_eoi,
     is_blurry,
+    load_camera_names,
     natural_key,
     parse_frame_name,
     probe_jpeg,
     read_blur_scores,
     setup_logging,
+    validate_camera_name,
     write_json,
     write_jsonl,
 )
-
-# Windows 传统 MAX_PATH 上限；超出时部分 API 会莫名失败，提前告警
-WINDOWS_PATH_WARN_LENGTH = 250
-
 
 @dataclass
 class FrameEntry:
@@ -58,30 +56,41 @@ class FrameEntry:
     source_frame: int
     width: int
     height: int
-    # 两个字段都可能是 None：旧版 clean_video.py 没留下 _scores.jsonl
+    camera: str = DEFAULT_CAMERA
     blur_score: Optional[float] = None
     is_blurry: Optional[bool] = None
 
 
 @dataclass
 class EpisodePlan:
-    """一个 episode（尚未落盘）。
-
-    一个源视频可能被切成多段，每段是一个 episode（见 --max-episode-seconds）。
-    """
+    """一个 episode/segment 及其每一路相机的同步帧。"""
 
     episode_index: int
-    source_video: str
-    frames: List[FrameEntry] = field(default_factory=list)
-    # 该视频的原始帧率；None 表示未知（timestamp 退回名义值）
+    episode: str
+    episode_dir: str
+    cameras: List[str]
+    camera_frames: Dict[str, List[FrameEntry]]
+    source_prefixes: Dict[str, str]
+    source_fps_by_camera: Dict[str, Optional[float]] = field(default_factory=dict)
+    source_fps_origin_by_camera: Dict[str, Optional[str]] = field(default_factory=dict)
     source_fps: Optional[float] = None
-    # 帧率的来源，取值见 FPS_ORIGIN_* 常量
     source_fps_origin: Optional[str] = None
-    # 从原始帧号的间隔反推出的抽帧步长
     observed_step: Optional[int] = None
-    # 该视频被切成的第几段（0 起）；不切分时恒为 0
     segment_index: int = 0
     segment_count: int = 1
+
+    @property
+    def frames(self) -> List[FrameEntry]:
+        """主相机帧，供报告/兼容代码使用。"""
+        return self.camera_frames[self.cameras[0]]
+
+    @property
+    def source_video(self) -> str:
+        return self.source_prefixes[self.cameras[0]]
+
+    @property
+    def length(self) -> int:
+        return len(self.frames)
 
 
 @dataclass
@@ -91,9 +100,7 @@ class Counters:
     unparsed: int = 0
     duplicate: int = 0
     corrupt: int = 0
-    copied: int = 0
-    linked: int = 0
-    already_present: int = 0
+    unassigned: int = 0
 
 
 def load_images_meta(input_dir: Path) -> dict:
@@ -173,57 +180,67 @@ def infer_frame_step(frames: List[FrameEntry]) -> Optional[int]:
     return step or None
 
 
-def resolve_episode_fps(
-    episode: EpisodePlan, args: argparse.Namespace, meta_fps: Dict[str, float]
-) -> Tuple[Optional[float], str]:
-    """决定该 episode 的原始帧率，返回 (fps, 来源)。
-
-    优先级：_meta.json 记录 > 从帧号间隔反推 > 无（用名义时间戳）。
-    同时交叉校验：_meta.json 记的帧率对应的步长，应该等于从帧号反推的步长。
-    """
+def resolve_camera_fps(
+    frames: List[FrameEntry],
+    source_video: str,
+    target_fps: int,
+    meta_fps: Dict[str, float],
+) -> Tuple[Optional[float], str, Optional[int]]:
+    """决定某一路相机的原始帧率，返回 (fps, 来源, 观测步长)。"""
     logger = logging.getLogger("format_dataset")
-    episode.observed_step = infer_frame_step(episode.frames)
+    observed_step = infer_frame_step(frames)
 
-    recorded = meta_fps.get(episode.source_video)
+    recorded = meta_fps.get(source_video)
     if recorded:
-        expected_step = max(1, int(round(recorded / float(args.fps))))
-        if episode.observed_step and episode.observed_step != expected_step:
+        expected_step = max(1, int(round(recorded / float(target_fps))))
+        if observed_step and observed_step != expected_step:
             logger.warning(
                 "%s：%s 记录的帧率 %g 对应步长 %d，但从帧号反推的步长是 %d，两者不符"
                 "（素材与 %s 可能对不上），仍按记录值处理",
-                episode.source_video,
+                source_video,
                 IMAGES_META_FILENAME,
                 recorded,
                 expected_step,
-                episode.observed_step,
+                observed_step,
                 IMAGES_META_FILENAME,
             )
-        return recorded, FPS_ORIGIN_RECORDED
+        return recorded, FPS_ORIGIN_RECORDED, observed_step
 
-    if episode.observed_step:
-        inferred = episode.observed_step * float(args.fps)
+    if observed_step:
+        inferred = observed_step * float(target_fps)
         logger.warning(
             "%s：%s 中没有该视频的帧率记录，按帧号间隔反推为 %g fps（步长 %d × %d）。"
             "这是近似值（误差约 ±%g fps）；要精确值请重跑 clean_video.py 生成 %s",
-            episode.source_video,
+            source_video,
             IMAGES_META_FILENAME,
             inferred,
-            episode.observed_step,
-            args.fps,
-            args.fps / 2.0,
+            observed_step,
+            target_fps,
+            target_fps / 2.0,
             IMAGES_META_FILENAME,
         )
-        return inferred, FPS_ORIGIN_INFERRED
+        return inferred, FPS_ORIGIN_INFERRED, observed_step
 
     logger.warning(
         "%s：既无 %s 记录、也无法从帧号反推帧率（只有 %d 帧），"
         "将使用名义时间戳 frame_index/%d —— 该时间轴按保留帧数计，帧号有缺口时会偏小",
-        episode.source_video,
+        source_video,
         IMAGES_META_FILENAME,
-        len(episode.frames),
-        args.fps,
+        len(frames),
+        target_fps,
     )
-    return None, FPS_ORIGIN_NOMINAL
+    return None, FPS_ORIGIN_NOMINAL, None
+
+
+def resolve_episode_fps(
+    episode: EpisodePlan, args: argparse.Namespace, meta_fps: Dict[str, float]
+) -> Tuple[Optional[float], str]:
+    """兼容包装：解析主相机帧率。"""
+    fps, origin, step = resolve_camera_fps(
+        episode.frames, episode.source_video, args.fps, meta_fps
+    )
+    episode.observed_step = step
+    return fps, origin
 
 
 def split_segments(frames: List[FrameEntry], max_frames: int) -> List[List[FrameEntry]]:
@@ -241,24 +258,62 @@ def split_segments(frames: List[FrameEntry], max_frames: int) -> List[List[Frame
 def scan_input(
     input_dir: Path,
     counters: Counters,
+    target_fps: int,
     blur_scores: Optional[Dict[str, Dict[int, float]]] = None,
     blur_threshold: float = 0.0,
     max_frames_per_episode: int = 0,
+    group_by: Optional[str] = None,
+    default_camera: str = DEFAULT_CAMERA,
+    images_meta: Optional[dict] = None,
+    camera_names: Optional[Dict[str, str]] = None,
+    meta_fps: Optional[Dict[str, float]] = None,
 ) -> List[EpisodePlan]:
-    """扫描输入目录，按视频名前缀分组，必要时把长视频切成多个 episode。
-
-    blur_scores 来自 _scores.jsonl；缺失时每帧的分数记为 None。
-    """
+    """扫描图片并按 episode/相机分组、校验同步、切分。"""
     logger = logging.getLogger("format_dataset")
-    grouped: Dict[str, Dict[int, Tuple[Path, int, int]]] = defaultdict(dict)
     scores = blur_scores or {}
+    camera_names = camera_names or {}
+    meta_fps = meta_fps or {}
+    meta = images_meta or {}
+    meta_format = meta.get("format")
+    meta_group_by = meta.get("group_by") if meta_format == 3 else "file"
+    if group_by is not None and meta_format == 3 and group_by != meta_group_by:
+        raise ValueError(
+            f"_meta.json 的 group_by={meta_group_by!r}，"
+            f"与本次 --group-by {group_by!r} 不一致"
+        )
+    actual_group_by = group_by or meta_group_by or "file"
+    if actual_group_by == "dir" and meta_format != 3:
+        raise ValueError(
+            "--group-by dir 需要 format 3 的 _meta.json；"
+            "请用 clean_video.py --group-by dir 重跑第一步"
+        )
 
+    prefix_meta: Dict[str, Tuple[str, str, str, str]] = {}
+    if meta_format == 3 and isinstance(meta.get("episodes"), dict):
+        videos_meta = meta.get("videos") if isinstance(meta.get("videos"), dict) else {}
+        for episode, info in meta["episodes"].items():
+            if not isinstance(info, dict):
+                continue
+            cameras_map = info.get("cameras")
+            if not isinstance(cameras_map, dict):
+                continue
+            episode_dir = str(info.get("episode_dir", "."))
+            for camera, prefix in cameras_map.items():
+                if not isinstance(camera, str) or not isinstance(prefix, str):
+                    continue
+                video_info = videos_meta.get(prefix)
+                stem = (
+                    str(video_info.get("source_stem", prefix))
+                    if isinstance(video_info, dict)
+                    else prefix
+                )
+                prefix_meta[prefix] = (str(episode), camera, episode_dir, stem)
+
+    grouped: Dict[str, Dict[int, Tuple[Path, int, int]]] = defaultdict(dict)
     for path in sorted(input_dir.iterdir()):
         if not path.is_file():
             continue
         if path.name.startswith(METADATA_PREFIX):
-            # _meta.json / _scores.jsonl 等下划线开头的是上游元数据，不是帧图片。
-            # 不跳过的话它们会被当成「文件名不符规范」而误报 warning。
             continue
 
         parsed = parse_frame_name(path)
@@ -269,7 +324,6 @@ def scan_input(
 
         video_name, source_frame = parsed
         if source_frame in grouped[video_name]:
-            # 同名同帧号出现两次（例如历史上两轮 glob 把同一文件收了两次）
             logger.warning(
                 "跳过重复帧：%s 的帧号 %d 已由 %s 提供，忽略 %s",
                 video_name,
@@ -296,13 +350,34 @@ def scan_input(
 
         grouped[video_name][source_frame] = (path, size[0], size[1])
 
-    # 视频名自然序；组内按原始帧号整数序（不是字符串序）
-    plans: List[EpisodePlan] = []
-    episode_index = 0
-    for video_name in sorted(grouped, key=natural_key):
-        video_scores = scores.get(video_name, {})
+    per_episode: Dict[str, Dict[str, List[FrameEntry]]] = {}
+    episode_dirs: Dict[str, str] = {}
+    source_prefixes: Dict[str, Dict[str, str]] = {}
+
+    for prefix in sorted(grouped, key=natural_key):
+        if prefix in prefix_meta:
+            episode, recorded_camera, episode_dir, stem = prefix_meta[prefix]
+        elif actual_group_by == "file":
+            episode, recorded_camera, episode_dir, stem = prefix, default_camera, ".", prefix
+        else:
+            counters.unassigned += len(grouped[prefix])
+            logger.warning(
+                "dir 模式下发现未登记的图片前缀 %s，跳过 %d 帧",
+                prefix,
+                len(grouped[prefix]),
+            )
+            continue
+
+        camera = camera_names.get(stem, recorded_camera)
+        reason = validate_camera_name(camera)
+        if reason:
+            raise ValueError(f"{prefix} 的相机名 {camera!r} 非法：{reason}")
+        cameras_map = per_episode.setdefault(episode, {})
+        if camera in cameras_map:
+            raise ValueError(f"{episode} 的相机名重复：{camera}")
+        video_scores = scores.get(prefix, {})
         frames: List[FrameEntry] = []
-        for frame_no, (path, width, height) in sorted(grouped[video_name].items()):
+        for frame_no, (path, width, height) in sorted(grouped[prefix].items()):
             score = video_scores.get(frame_no)
             frames.append(
                 FrameEntry(
@@ -310,110 +385,169 @@ def scan_input(
                     source_frame=frame_no,
                     width=width,
                     height=height,
+                    camera=camera,
                     blur_score=score,
                     is_blurry=None if score is None else is_blurry(score, blur_threshold),
                 )
             )
+        cameras_map[camera] = frames
+        episode_dirs[episode] = episode_dir
+        source_prefixes.setdefault(episode, {})[camera] = prefix
 
-        segments = split_segments(frames, max_frames_per_episode)
-        for segment_index, segment in enumerate(segments):
+    if not per_episode:
+        return []
+
+    camera_sets = {frozenset(names) for names in per_episode.values()}
+    if len(camera_sets) > 1:
+        detail = "; ".join(
+            f"{episode}: {sorted(names)}" for episode, names in sorted(per_episode.items())
+        )
+        raise ValueError(f"不同 episode 的相机集合不一致：{detail}")
+    cameras = canonical_camera_order(next(iter(camera_sets)))
+    declared = meta.get("cameras") if meta_format == 3 else None
+    if isinstance(declared, list) and set(declared) == set(cameras):
+        cameras = list(declared)
+
+    plans: List[EpisodePlan] = []
+    episode_index = 0
+    for episode in sorted(per_episode, key=natural_key):
+        cameras_map = per_episode[episode]
+        primary = cameras[0]
+        primary_frames = cameras_map[primary]
+        n = len(primary_frames)
+        reference_frames = [frame.source_frame for frame in primary_frames]
+
+        for camera in cameras:
+            frames = cameras_map[camera]
+            if len(frames) != n:
+                raise ValueError(
+                    f"{episode} 的相机 {camera} 有 {len(frames)} 帧，"
+                    f"主相机 {primary} 有 {n} 帧"
+                )
+            got = [frame.source_frame for frame in frames]
+            if got != reference_frames:
+                position = next(
+                    index
+                    for index, (left, right) in enumerate(zip(reference_frames, got))
+                    if left != right
+                )
+                raise ValueError(
+                    f"{episode} 的相机 {camera} 与 {primary} 的 source_frame 序列"
+                    f"在第 {position} 个位置不一致：{got[position]} vs {reference_frames[position]}"
+                )
+            dims = Counter((frame.width, frame.height) for frame in frames)
+            if len(dims) > 1:
+                logger.warning(
+                    "%s/%s 内部有多种图片尺寸（%s）；第三步会拒绝尺寸不符的帧",
+                    episode,
+                    camera,
+                    dict(dims),
+                )
+
+        fps_by_camera: Dict[str, Optional[float]] = {}
+        origin_by_camera: Dict[str, Optional[str]] = {}
+        observed_steps: Dict[str, Optional[int]] = {}
+        for camera in cameras:
+            fps, origin, step = resolve_camera_fps(
+                cameras_map[camera],
+                source_prefixes[episode][camera],
+                target_fps,
+                meta_fps,
+            )
+            fps_by_camera[camera] = fps
+            origin_by_camera[camera] = origin
+            observed_steps[camera] = step
+
+        known_rates = {round(value, 6) for value in fps_by_camera.values() if value is not None}
+        if len(known_rates) > 1:
+            raise ValueError(f"{episode} 各相机原始帧率不一致：{fps_by_camera}")
+        episode_fps = next(
+            (value for value in fps_by_camera.values() if value is not None), None
+        )
+        if episode_fps is not None:
+            missing = [camera for camera, value in fps_by_camera.items() if value is None]
+            if missing:
+                logger.warning(
+                    "%s 的部分相机没有原始帧率（%s）；使用其他相机的 %g",
+                    episode,
+                    ", ".join(missing),
+                    episode_fps,
+                )
+        origins = list(origin_by_camera.values())
+        if all(origin == FPS_ORIGIN_RECORDED for origin in origins):
+            aggregate_origin = FPS_ORIGIN_RECORDED
+        elif FPS_ORIGIN_NOMINAL in origins:
+            aggregate_origin = FPS_ORIGIN_NOMINAL
+        else:
+            aggregate_origin = FPS_ORIGIN_INFERRED
+        steps = {step for step in observed_steps.values() if step is not None}
+        if len(steps) > 1:
+            raise ValueError(f"{episode} 各相机观测步长不一致：{observed_steps}")
+        observed_step = next(iter(steps), None)
+
+        if max_frames_per_episode <= 0 or n <= max_frames_per_episode:
+            ranges = [(0, n)]
+        else:
+            ranges = [
+                (start, min(start + max_frames_per_episode, n))
+                for start in range(0, n, max_frames_per_episode)
+            ]
+
+        for segment_index, (start, end) in enumerate(ranges):
             plans.append(
                 EpisodePlan(
                     episode_index=episode_index,
-                    source_video=video_name,
-                    frames=segment,
+                    episode=episode,
+                    episode_dir=episode_dirs[episode],
+                    cameras=list(cameras),
+                    camera_frames={
+                        camera: cameras_map[camera][start:end] for camera in cameras
+                    },
+                    source_prefixes={
+                        camera: source_prefixes[episode][camera] for camera in cameras
+                    },
+                    source_fps_by_camera=dict(fps_by_camera),
+                    source_fps_origin_by_camera=dict(origin_by_camera),
+                    source_fps=episode_fps,
+                    source_fps_origin=aggregate_origin,
+                    observed_step=observed_step,
                     segment_index=segment_index,
-                    segment_count=len(segments),
+                    segment_count=len(ranges),
                 )
             )
             episode_index += 1
     return plans
 
 
-def resolve_link_mode(requested: str, sample_src: Path, dst_dir: Path) -> str:
-    """把 auto 解析成实际可用的方式：硬链接 -> 软链接 -> 复制。"""
-    logger = logging.getLogger("format_dataset")
-    if requested != "auto":
-        return requested
-
-    probe_dst = dst_dir / ".__link_probe__"
-    for mode in ("hardlink", "symlink"):
-        try:
-            if probe_dst.exists() or probe_dst.is_symlink():
-                probe_dst.unlink()
-            create_link(mode, sample_src.resolve(), probe_dst)
-        except OSError as exc:
-            logger.debug("%s 探测失败：%s", mode, exc)
-            continue
-        finally:
-            try:
-                if probe_dst.exists() or probe_dst.is_symlink():
-                    probe_dst.unlink()
-            except OSError:
-                pass
-        logger.info("链接方式自动判定为：%s", mode)
-        return mode
-
-    logger.info("链接方式自动判定为：copy（硬链接与软链接均不可用）")
-    return "copy"
-
-
-def create_link(mode: str, src: Path, dst: Path) -> None:
-    """按指定方式把 src 落成 dst。"""
-    if mode == "hardlink":
-        os.link(str(src), str(dst))
-    elif mode == "symlink":
-        os.symlink(str(src), str(dst))
-    else:
-        shutil.copy2(str(src), str(dst))
-
-
-def materialize(
-    src: Path, dst: Path, mode: str, force: bool, counters: Counters
-) -> Optional[str]:
-    """把一帧原图落到目标路径。返回实际动作，失败返回 None。"""
-    logger = logging.getLogger("format_dataset")
+def relative_image_root(input_dir: Path, output_dir: Path) -> str:
+    """从 dataset/ 指向图片目录的相对路径，写进 info.json 的 extras.image_root。"""
     try:
-        if dst.exists() or dst.is_symlink():
-            try:
-                if dst.samefile(src):
-                    counters.already_present += 1
-                    return "present"
-            except OSError:
-                pass
-            if not force:
-                logger.warning("目标已存在且不是同一文件，跳过（用 --force 覆盖）：%s", dst)
-                return None
-            dst.unlink()
-
-        create_link(mode, src.resolve(), dst)
-    except OSError:
-        logger.exception("落盘失败：%s -> %s", src, dst)
-        return None
-
-    if mode == "copy":
-        counters.copied += 1
-    else:
-        counters.linked += 1
-    return mode
-
-
-def episode_chunk(episode_index: int, chunks_size: int) -> int:
-    return episode_index // chunks_size
+        return Path(os.path.relpath(input_dir.resolve(), output_dir.resolve())).as_posix()
+    except ValueError:
+        # Windows 跨盘符无法相对化，退回绝对路径
+        return input_dir.resolve().as_posix()
 
 
 def build_info_json(
     args: argparse.Namespace,
-    camera_key: str,
+    cameras: List[str],
     episodes: List[EpisodePlan],
-    dims: Counter,
-    total_frames: int,
+    dims_by_camera: Dict[str, Counter],
+    total_samples: int,
+    image_root: str,
+    group_by: str,
+    source_root: Optional[str] = None,
+    camera_names: Optional[Dict[str, str]] = None,
 ) -> dict:
-    """组装 meta/info.json。标准字段对齐上游，非标准信息一律塞进 extras。"""
-    if dims:
-        (width, height), _ = dims.most_common(1)[0]
-    else:
-        width, height = 0, 0
+    """组装 meta/info.json（纯清单，多相机各一个 feature）。"""
+    camera_shapes: Dict[str, Tuple[int, int]] = {}
+    for camera in cameras:
+        dims = dims_by_camera.get(camera) or Counter()
+        if dims:
+            (width, height), _ = dims.most_common(1)[0]
+        else:
+            width, height = 0, 0
+        camera_shapes[camera] = (width, height)
 
     origins = {episode.source_fps_origin for episode in episodes}
     if origins == {FPS_ORIGIN_RECORDED}:
@@ -429,72 +563,107 @@ def build_info_json(
             "见 source_fps_origin_by_video）"
         )
 
-    sources = [
-        {
-            "source_video": episode.source_video,
-            "episode_index": episode.episode_index,
-            "frames": len(episode.frames),
-            "fps": args.fps,
-            "orig_fps": episode.source_fps,
-            "orig_fps_origin": episode.source_fps_origin,
-            "observed_frame_step": episode.observed_step,
-            "first_source_frame": episode.frames[0].source_frame,
-            "last_source_frame": episode.frames[-1].source_frame,
-        }
-        for episode in episodes
-        if episode.frames
-    ]
+    sources = []
+    for episode in episodes:
+        if not episode.frames:
+            continue
+        camera_entries = []
+        for camera in episode.cameras:
+            width, height = camera_shapes.get(camera, (0, 0))
+            frames = episode.camera_frames[camera]
+            camera_entries.append(
+                {
+                    "name": camera,
+                    "source_video": episode.source_prefixes[camera],
+                    "orig_fps": episode.source_fps_by_camera.get(camera),
+                    "orig_fps_origin": episode.source_fps_origin_by_camera.get(camera),
+                    "observed_frame_step": episode.observed_step,
+                    "shape": [height, width, 3],
+                    "first_source_frame": frames[0].source_frame,
+                    "last_source_frame": frames[-1].source_frame,
+                }
+            )
+        sources.append(
+            {
+                "episode": episode.episode,
+                "episode_dir": episode.episode_dir,
+                "episode_index": episode.episode_index,
+                "source_video": episode.source_video,
+                "frames": episode.length,
+                "fps": args.fps,
+                "orig_fps": episode.source_fps,
+                "orig_fps_origin": episode.source_fps_origin,
+                "observed_frame_step": episode.observed_step,
+                "first_source_frame": episode.frames[0].source_frame,
+                "last_source_frame": episode.frames[-1].source_frame,
+                "cameras": camera_entries,
+            }
+        )
 
-    return {
-        "codebase_version": "v2.0",
-        "robot_type": "unknown",
-        "total_episodes": len(episodes),
-        "total_frames": total_frames,
-        "total_tasks": 0,
-        "total_videos": 0,
-        "total_chunks": max(1, -(-len(episodes) // args.chunks_size)) if episodes else 0,
-        "chunks_size": args.chunks_size,
-        "fps": args.fps,
-        "splits": {"train": f"0:{len(episodes)}"},
-        "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-        "video_path": "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4",
-        "features": {
-            camera_key: {
-                # 上游此处为 "video"；我们存的是 jpg 帧序列，故标 "image"。
-                "dtype": "image",
-                "shape": [height, width, 3],
-                "names": ["height", "width", "channels"],
-                "info": {
-                    "frame_dir": f"videos/chunk-{{episode_chunk:03d}}/{{video_key}}/episode_{{episode_index:06d}}/"
-                },
-            },
+    fps_by_video: Dict[str, Optional[float]] = {}
+    origin_by_video: Dict[str, Optional[str]] = {}
+    step_by_video: Dict[str, Optional[int]] = {}
+    for episode in episodes:
+        for camera in episode.cameras:
+            prefix = episode.source_prefixes[camera]
+            fps_by_video[prefix] = episode.source_fps_by_camera.get(camera)
+            origin_by_video[prefix] = episode.source_fps_origin_by_camera.get(camera)
+            step_by_video[prefix] = episode.observed_step
+
+    features = {}
+    for camera in cameras:
+        width, height = camera_shapes[camera]
+        features[camera_key(camera)] = {
+            "dtype": "image",
+            "shape": [height, width, 3],
+            "names": ["height", "width", "channels"],
+        }
+    features.update(
+        {
             "timestamp": {"dtype": "float32", "shape": [1], "names": None},
             "frame_index": {"dtype": "int64", "shape": [1], "names": None},
             "episode_index": {"dtype": "int64", "shape": [1], "names": None},
             "index": {"dtype": "int64", "shape": [1], "names": None},
             "task_index": {"dtype": "int64", "shape": [1], "names": None},
-            # 本项目扩展（上游没有）。blur_score 由 clean_video.py 算出，
-            # is_blurry 是按 --blur-threshold 标记的结论；帧本身完整保留。
-            "blur_score": {"dtype": "float32", "shape": [1], "names": None},
-            "is_blurry": {"dtype": "bool", "shape": [1], "names": None},
-        },
+            # 本项目扩展：blur_score/is_blurry 按相机顺序排列。
+            "blur_score": {
+                "dtype": "float32",
+                "shape": [len(cameras)],
+                "names": cameras if len(cameras) > 1 else None,
+            },
+            "is_blurry": {
+                "dtype": "bool",
+                "shape": [len(cameras)],
+                "names": cameras if len(cameras) > 1 else None,
+            },
+        }
+    )
+
+    return {
+        "codebase_version": "v3.0-manifest",
+        "robot_type": "unknown",
+        "total_episodes": len(episodes),
+        "total_frames": total_samples,
+        "total_tasks": 0,
+        "total_videos": 0,
+        "fps": args.fps,
+        "splits": {"train": f"0:{len(episodes)}"},
+        "features": features,
         "extras": {
             "note": (
-                "images-only skeleton mimicking LeRobot v2.0 layout; "
-                "no action/state, no parquet, no mp4"
+                "manifest-only intermediate; frames remain in the step-1 image directory"
             ),
             "generated_from": str(args.input),
-            "camera_key": camera_key,
-            "link_mode": args.link_mode,
-            "source_fps_by_video": {
-                episode.source_video: episode.source_fps for episode in episodes
-            },
-            "source_fps_origin_by_video": {
-                episode.source_video: episode.source_fps_origin for episode in episodes
-            },
-            "observed_frame_step_by_video": {
-                episode.source_video: episode.observed_step for episode in episodes
-            },
+            "image_root": image_root,
+            "group_by": group_by,
+            "source_root": source_root,
+            "camera_names": dict(camera_names or {}),
+            "cameras": list(cameras),
+            "camera_key": camera_key(cameras[0]) if len(cameras) == 1 else None,
+            "total_camera_rows": total_samples * len(cameras),
+            "source_fps_by_video": fps_by_video,
+            "source_fps_origin_by_video": origin_by_video,
+            "observed_frame_step_by_video": step_by_video,
             "blur_score_threshold": args.blur_threshold,
             "max_episode_seconds": args.max_episode_seconds,
             "timestamp_source": timestamp_source,
@@ -505,25 +674,28 @@ def build_info_json(
 
 def build_readme(
     args: argparse.Namespace,
-    camera_key: str,
+    cameras: List[str],
     counters: Counters,
     episodes: List[EpisodePlan],
 ) -> str:
-    """生成 meta/README.md：把与上游 LeRobot 的差异讲清楚。"""
+    """生成 meta/README.md：说明纯清单产物与多相机契约。"""
     lines = []
     for episode in episodes:
-        fps_text = f"{episode.source_fps:g}" if episode.source_fps else "未知"
-        lines.append(
-            f"| {episode.source_video} | {fps_text} | {episode.observed_step or '-'} | "
-            f"{episode.source_fps_origin} | {len(episode.frames)} |"
-        )
+        for camera in episode.cameras:
+            fps = episode.source_fps_by_camera.get(camera)
+            fps_text = f"{fps:g}" if fps else "未知"
+            origin = episode.source_fps_origin_by_camera.get(camera)
+            lines.append(
+                f"| {episode.episode} | {camera} | {episode.source_prefixes[camera]} | "
+                f"{fps_text} | {episode.observed_step or '-'} | {origin} | {episode.length} |"
+            )
     rows = "\n".join(lines)
     timestamp_note = (
         "对每个 episode 独立计算：`(source_frame - 本段首帧) / 该视频的原始帧率`，"
         "即**相对本段起点**的秒数（lerobot 写的就是 `frame_index / fps`，两者一致）。"
-        "跨段的绝对位置看 `source_frame`。\n\n"
-        "| source_video | 原始帧率 | 观测步长 | 帧率来源 | 帧数 |\n"
-        "|---|---|---|---|---|\n"
+        "跨段的绝对位置看 `source_frame`。所有相机共用同一个 timestamp。\n\n"
+        "| episode | camera | source_video | 原始帧率 | 观测步长 | 帧率来源 | 帧数 |\n"
+        "|---|---|---|---|---|---|---|\n"
         f"{rows}\n\n"
         "帧率来源的含义：\n\n"
         f"- `{FPS_ORIGIN_RECORDED}`：精确值，来自 `clean_video.py` 写下的原始帧率\n"
@@ -532,93 +704,82 @@ def build_readme(
         f"- `{FPS_ORIGIN_NOMINAL}`：**该 episode 没有可用的原始帧率**，"
         f"退回 `frame_index / {args.fps}`。该时间轴按保留帧数计时，帧号有缺口时会系统性偏小\n"
     )
-    return f"""# 数据集说明（仿 LeRobot v2.0）
+    return f"""# 清单说明
 
-本目录由 `format_dataset.py` 生成，**仅使用 Python 标准库**，未引入 `lerobot` / `pyarrow`。
+本目录由 `format_dataset.py` 生成，**只包含清单**；帧图片仍留在第一步的图片目录
+（`info.json` 的 `extras.image_root`），这里不复制、不链接图片。
 
-## 与上游 LeRobot v2.0 的差异
+## 文件
 
-| 项目 | 上游 LeRobot v2.0 | 本数据集 |
-|---|---|---|
-| `data/` | 每个 episode 一个 `.parquet`（含 `observation.state` / `action` / `timestamp` 等） | **空目录**，保留结构占位 |
-| `videos/` | 每个 episode 一个 `.mp4` | 每个 episode 一个**图片目录**，内含逐帧 `.jpg` |
-| 相机特征 `dtype` | `"video"` | `"image"` |
-| `meta/episodes.jsonl` | 有 | 有（语义一致，一行一个 episode） |
-| `meta/frames.jsonl` | **无此文件** | 有，本脚本扩展，一行一帧 |
-| `meta/tasks.jsonl` | 有 | 有，但无任务标注时为空文件 |
-| `meta/stats.json` | 有 | **未生成**（需要解码像素才能统计） |
+| 文件 | 内容 |
+|---|---|
+| `frames.jsonl` | 一行一个（相机，帧）；`path` 相对 `image_root` |
+| `episodes.jsonl` | 一行一个 episode/segment |
+| `info.json` | 每路相机的形状、fps、阈值、image_root、来源记录 |
+| `tasks.jsonl` | 任务标注，当前为空 |
+| `actions/` | 可选；由 `import_actions.py` 写入 |
 
-### 最根本的差异
-
-LeRobot 是**模仿学习**数据集，核心是 `(observation, action)` 配对。
-本数据集**只有 observation，没有 action / state / reward**，
-因此它可以用于感知预训练、世界模型、视频预测，但**不能直接用于训练策略**，
-也无法被 `lerobot` 的 loader 直接加载。
+最终 LeRobot 数据集由 `export_lerobot.py` 生成。本目录不是 LeRobot 数据集，
+也不能被 lerobot loader 直接加载。
 
 ## 时序说明
 
-`clean_video.py` 保存**全部**采样帧，不丢弃任何帧 —— 帧因此落在 `1/fps` 的均匀网格上，
-下游的时序查询（如 lerobot 的 `delta_timestamps`）才成立。帧号通常是连续的。
-
-文件名已按 episode 内位置重命名为 `frame_000000.jpg`，
-原始帧号保存在 `meta/frames.jsonl` 的 `source_frame` 字段中。
-
-一个源视频**可能对应多个 episode**：`--max-episode-seconds`（本次
-{args.max_episode_seconds:g} 秒）会把超长的视频切成等长的小段，每段是一个 episode。
-切分不是技术限制，而是为了训练时的样本独立性 —— episode 越长，一个 batch 里来自
-同一段连续视频的样本越多，时间上越相关。切分点记在 `meta/episodes.jsonl` 的
-`segment_index` / `segment_count`。
+`clean_video.py` 保存全部采样帧，帧落在 `1/fps` 的均匀网格上。一个源视频可能被
+`--max-episode-seconds`（本次 {args.max_episode_seconds:g} 秒）切成多个 episode；
+切分点记在 `episodes.jsonl` 的 `segment_index` / `segment_count`。
 
 - `frame_index`：episode 内的顺序位置（0, 1, 2, ... 连续）
-- `source_frame`：原始视频中的帧号（跨 episode 唯一，切分不会让它重置）
-- `blur_score`：该帧的 Laplacian 方差，由 `clean_video.py` 算出
-- `is_blurry`：按本次 `--blur-threshold {args.blur_threshold:g}` 标记的结论
+- `source_frame`：原始视频中的帧号（跨段不重置）
+- `camera`：该行属于哪一路相机
+- `blur_score` / `is_blurry`：该相机该帧的分数和阈值标记
+- `path`：相对 `image_root` 的文件名
 - `timestamp`：{timestamp_note}
 
-## 文件落盘方式
-
-`--link-mode` 实际使用：**{args.link_mode}**
-
-采用硬链接时，本目录的图片与原始 `output/images/` 是**同一个文件**（共享 inode），
-不额外占用磁盘空间；但修改其中任何一方都会影响另一方。
-若需完全独立，请改用 `--link-mode copy` 重新生成。
-
-## 未生成的字段
-
-`meta/info.json` 中的 `total_videos` 恒为 `0`，因为我们没有生成 mp4 文件。
+`info.json` 的 `extras.cameras` 是相机顺序；`blur_score` / `is_blurry` 向量
+（以及最终数据集里的 `blur_score`）都按这个顺序排列。所有相机必须同步：帧数、
+`source_frame` 序列和原始 fps 一致。
 
 ## 扫描统计
 
 | 项目 | 数量 |
 |---|---|
-| 已存在（跳过，未重复落盘） | {counters.already_present} |
-| 新建链接 | {counters.linked} |
-| 复制 | {counters.copied} |
 | 文件名不匹配（跳过） | {counters.unparsed} |
 | 重复帧号（跳过） | {counters.duplicate} |
 | 损坏 / 空文件（跳过） | {counters.corrupt} |
+| dir 模式下未登记的图片前缀（跳过） | {counters.unassigned} |
 """
 
 
 def report_plan(episodes: List[EpisodePlan], counters: Counters, logger: logging.Logger) -> int:
-    """打印扫描结果，返回总帧数。"""
+    """打印扫描结果，返回同步采样数。"""
     total = 0
     logger.info("=== 扫描结果 ===")
-    logger.info("%-30s %10s %14s %14s", "source_video", "frames", "first_frame", "last_frame")
+    logger.info(
+        "%-24s %8s %10s %14s %14s",
+        "episode", "cameras", "samples", "first_frame", "last_frame",
+    )
     for episode in episodes:
         first = episode.frames[0].source_frame
         last = episode.frames[-1].source_frame
         logger.info(
-            "%-30s %10d %14d %14d", episode.source_video, len(episode.frames), first, last
+            "%-24s %8d %10d %14d %14d",
+            episode.episode,
+            len(episode.cameras),
+            episode.length,
+            first,
+            last,
         )
-        total += len(episode.frames)
+        total += episode.length
     logger.info(
-        "合计：%d 个 episode，%d 帧（跳过：不匹配 %d，重复 %d，损坏 %d）",
+        "合计：%d 个 episode，%d 个同步采样，%d 个相机帧"
+        "（跳过：不匹配 %d，重复 %d，损坏 %d，未登记 %d）",
         len(episodes),
         total,
+        total * (len(episodes[0].cameras) if episodes else 0),
         counters.unparsed,
         counters.duplicate,
         counters.corrupt,
+        counters.unassigned,
     )
     return total
 
@@ -626,45 +787,73 @@ def report_plan(episodes: List[EpisodePlan], counters: Counters, logger: logging
 def report_blur(
     episodes: List[EpisodePlan], threshold: float, logger: logging.Logger
 ) -> None:
-    """报告按阈值会被标为模糊的帧数。只报告，不删任何帧。"""
+    """报告按阈值会被标为模糊的相机帧数。只报告，不删任何帧。"""
     logger.info("=== 模糊标记（阈值 %.1f，只标记不删帧）===", threshold)
-    logger.info("%-14s %9s %9s %9s", "source_video", "frames", "blurry", "rate")
+    logger.info("%-24s %8s %10s %10s %8s", "episode", "cameras", "samples", "cam_rows", "blurry")
     total = blurry_total = unknown_total = 0
     for episode in episodes:
-        frames = len(episode.frames)
-        blurry = sum(1 for f in episode.frames if f.is_blurry)
-        unknown_total += sum(1 for f in episode.frames if f.blur_score is None)
-        total += frames
+        camera_rows = sum(len(frames) for frames in episode.camera_frames.values())
+        blurry = sum(
+            1
+            for frames in episode.camera_frames.values()
+            for frame in frames
+            if frame.is_blurry
+        )
+        unknown_total += sum(
+            1
+            for frames in episode.camera_frames.values()
+            for frame in frames
+            if frame.blur_score is None
+        )
+        total += camera_rows
         blurry_total += blurry
-        rate = f"{blurry / frames * 100:.1f}%" if frames else "-"
-        logger.info("%-14s %9d %9d %9s", episode.source_video, frames, blurry, rate)
+        rate = f"{blurry / camera_rows * 100:.1f}%" if camera_rows else "-"
+        logger.info(
+            "%-24s %8d %10d %10d %8s",
+            episode.episode,
+            len(episode.cameras),
+            episode.length,
+            camera_rows,
+            rate,
+        )
 
     if total:
-        logger.info("合计：%d 帧中 %d 帧标为模糊（%.1f%%）", total, blurry_total, blurry_total / total * 100)
+        logger.info(
+            "合计：%d 个相机帧中 %d 个标为模糊（%.1f%%）",
+            total,
+            blurry_total,
+            blurry_total / total * 100,
+        )
     if unknown_total:
         logger.warning(
-            "另有 %d 帧没有模糊分数（缺 _scores.jsonl 或无对应记录），其 is_blurry 为 null",
+            "另有 %d 个相机帧没有模糊分数（缺 _scores.jsonl 或无对应记录），其 is_blurry 为 null",
             unknown_total,
         )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="把抽取出的图片整理成仿 LeRobot v2.0 布局的数据集骨架（仅用标准库）。"
+        description="把抽取出的图片整理成清单（中间产物，仅用标准库）。"
     )
     parser.add_argument("--input", "-i", default="output/images", help="输入图片目录（默认 output/images）")
-    parser.add_argument("--output", "-o", default="dataset", help="输出数据集目录（默认 dataset）")
+    parser.add_argument("--output", "-o", default="dataset", help="输出清单目录（默认 dataset）")
     parser.add_argument("--fps", type=int, default=5, help="处理帧率，写入 info.json 的 fps 字段（默认 5）")
     parser.add_argument(
-        "--camera", default=DEFAULT_CAMERA, help=f"相机名，生成 observation.images.<camera>（默认 {DEFAULT_CAMERA}）"
+        "--group-by",
+        choices=["file", "dir"],
+        default=None,
+        help="分组方式；缺省沿用 _meta.json（旧产物/缺省为 file）",
     )
     parser.add_argument(
-        "--link-mode",
-        choices=["auto", "hardlink", "symlink", "copy"],
-        default="auto",
-        help="文件落盘方式，auto = 硬链接 -> 软链接 -> 复制 依次降级（默认 auto）",
+        "--camera",
+        default=None,
+        help=f"file 模式的相机名（默认 {DEFAULT_CAMERA}）；dir 模式请用 --camera-names",
     )
-    parser.add_argument("--chunks-size", type=int, default=1000, help="每个 chunk 容纳的 episode 数（默认 1000）")
+    parser.add_argument(
+        "--camera-names",
+        default=None,
+        help="可选 JSON：文件名 stem -> 相机名；可在不重跑第一步的情况下改名",
+    )
     parser.add_argument(
         "--blur-threshold",
         type=float,
@@ -677,7 +866,7 @@ def parse_args() -> argparse.Namespace:
         default=60.0,
         help="单个 episode 的时长上限（秒）；超长的视频按此切成多段，0 表示不切（默认 60）",
     )
-    parser.add_argument("--force", action="store_true", help="输出目录已存在数据集时覆盖，并覆盖同名目标文件")
+    parser.add_argument("--force", action="store_true", help="已存在清单时覆盖")
     parser.add_argument("--dry-run", action="store_true", help="只扫描并打印报告，不创建任何文件")
     return parser.parse_args()
 
@@ -688,11 +877,7 @@ def main() -> int:
 
     input_dir = Path(args.input)
     output_dir = Path(args.output)
-    camera_key = f"observation.images.{args.camera}"
 
-    if args.chunks_size <= 0:
-        logger.error("--chunks-size 必须为正整数")
-        return 1
     if args.fps <= 0:
         logger.error("--fps 必须为正整数")
         return 1
@@ -710,6 +895,20 @@ def main() -> int:
 
     images_meta = load_images_meta(input_dir)
     meta_fps = extract_source_fps(images_meta)
+    meta_group_by = images_meta.get("group_by") if images_meta.get("format") == 3 else "file"
+    actual_group_by = args.group_by or meta_group_by or "file"
+    if actual_group_by == "dir" and args.camera is not None:
+        logger.error("dir 模式不能同时传 --camera；相机名请用 --camera-names 或文件名")
+        return 1
+    try:
+        camera_names = load_camera_names(
+            Path(args.camera_names) if args.camera_names else None
+        )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+    default_camera = args.camera or DEFAULT_CAMERA
+
     recorded_fps = images_meta.get("target_fps")
     if isinstance(recorded_fps, (int, float)) and recorded_fps != args.fps:
         logger.warning(
@@ -738,9 +937,21 @@ def main() -> int:
         )
 
     try:
-        episodes = scan_input(input_dir, counters, blur_scores, args.blur_threshold, max_frames)
-    except OSError:
-        logger.exception("扫描输入目录失败：%s", input_dir)
+        episodes = scan_input(
+            input_dir,
+            counters,
+            args.fps,
+            blur_scores,
+            args.blur_threshold,
+            max_frames,
+            group_by=args.group_by,
+            default_camera=default_camera,
+            images_meta=images_meta,
+            camera_names=camera_names,
+            meta_fps=meta_fps,
+        )
+    except (OSError, ValueError) as exc:
+        logger.error("%s", exc)
         return 1
 
     episodes = [episode for episode in episodes if episode.frames]
@@ -748,30 +959,26 @@ def main() -> int:
         logger.error("在 %s 中没有找到任何可用的帧图片", input_dir)
         return 1
 
-    for episode in episodes:
-        episode.source_fps, episode.source_fps_origin = resolve_episode_fps(
-            episode, args, meta_fps
-        )
-
-    total_frames = report_plan(episodes, counters, logger)
+    total_samples = report_plan(episodes, counters, logger)
+    cameras = episodes[0].cameras
     logger.info("=== 原始帧率 ===")
     logger.info(
-        "%-14s %10s %12s %12s %10s", "source_video", "orig_fps", "step(观测)", "step(期望)", "来源"
+        "%-24s %-12s %10s %12s %12s %10s",
+        "episode", "camera", "orig_fps", "step(观测)", "step(期望)", "来源",
     )
     for episode in episodes:
-        expected = (
-            max(1, int(round(episode.source_fps / float(args.fps))))
-            if episode.source_fps
-            else None
-        )
-        logger.info(
-            "%-14s %10s %12s %12s %10s",
-            episode.source_video,
-            f"{episode.source_fps:g}" if episode.source_fps else "未知",
-            episode.observed_step if episode.observed_step else "-",
-            expected if expected else "-",
-            episode.source_fps_origin,
-        )
+        for camera in episode.cameras:
+            fps = episode.source_fps_by_camera.get(camera)
+            expected = max(1, int(round(fps / float(args.fps)))) if fps else None
+            logger.info(
+                "%-24s %-12s %10s %12s %12s %10s",
+                episode.episode,
+                camera,
+                f"{fps:g}" if fps else "未知",
+                episode.observed_step if episode.observed_step else "-",
+                expected if expected else "-",
+                episode.source_fps_origin_by_camera.get(camera),
+            )
     distinct_steps = {e.observed_step for e in episodes if e.observed_step}
     if len(distinct_steps) > 1:
         logger.info(
@@ -785,123 +992,77 @@ def main() -> int:
         logger.info("--dry-run：未创建任何文件，耗时 %.2fs", time.time() - start_ts)
         return 0
 
-    # ---- 建目录 ----
+    # ---- 建清单目录 ----
+    meta_dir = output_dir / META_DIRNAME
     try:
-        data_dir = output_dir / "data"
-        meta_dir = output_dir / META_DIRNAME
-        videos_dir = output_dir / "videos"
-        for directory in (data_dir, meta_dir, videos_dir):
-            directory.mkdir(parents=True, exist_ok=True)
-        # data/ 目前没有 parquet 可放，留 .gitkeep 保住目录结构
-        (data_dir / ".gitkeep").touch()
+        meta_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         logger.exception("创建输出目录失败：%s", output_dir)
         return 1
 
-    # ---- 决定落盘方式 ----
-    try:
-        link_mode = resolve_link_mode(args.link_mode, episodes[0].frames[0].src, output_dir)
-    except OSError:
-        logger.exception("无法确定落盘方式，请显式指定 --link-mode copy")
-        return 1
-    if link_mode != args.link_mode:
-        args.link_mode = link_mode
-
-    # ---- 落盘 + 收集元信息 ----
-    dims: Counter = Counter()
+    # ---- 收集元信息（不复制/链接图片）----
+    dims_by_camera: Dict[str, Counter] = {camera: Counter() for camera in cameras}
     episode_rows: List[EpisodeRow] = []
     frame_rows: List[FrameRow] = []
     global_index = 0
-    dumped = 0
-    path_warned = False
-    warn_length = len(str((output_dir / "videos").resolve())) + 70
 
     for episode in episodes:
-        chunk = episode_chunk(episode.episode_index, args.chunks_size)
-        frame_dir = videos_dir / f"chunk-{chunk:03d}" / camera_key / f"episode_{episode.episode_index:06d}"
-
-        try:
-            frame_dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            logger.exception("创建 episode 目录失败：%s", frame_dir)
-            continue
-
-        if not path_warned and warn_length > WINDOWS_PATH_WARN_LENGTH:
-            logger.warning(
-                "目标路径接近 Windows MAX_PATH 上限（约 %d 字符），若出现莫名 IO 失败请缩短 --output 路径",
-                warn_length,
-            )
-            path_warned = True
-
-        # 显式相对 output_dir 取路径：直接用 frame_dir.as_posix() 的话，
-        # 一旦 --output 传的是绝对路径，写进 jsonl 的就会是本机绝对路径，数据集不可移植。
-        frame_dir_rel = frame_dir.relative_to(output_dir).as_posix()
-        kept = 0
-        # timestamp 相对本段起点计时，而不是视频起点：一个视频可能被切成多段，
-        # 每段的 timestamp 都从 0 开始 —— lerobot 写的就是 frame_index / fps，
-        # 两者必须一致。跨段的绝对位置由 source_frame 承载。
+        # timestamp 相对本段起点计时，而不是视频起点；所有相机共用。
         segment_start = episode.frames[0].source_frame
+        timestamps = []
         for position, entry in enumerate(episode.frames):
-            dims[(entry.width, entry.height)] += 1
-
             if episode.source_fps:
-                timestamp = round((entry.source_frame - segment_start) / episode.source_fps, 6)
+                timestamps.append(
+                    round((entry.source_frame - segment_start) / episode.source_fps, 6)
+                )
             else:
-                timestamp = round(position / args.fps, 6)
+                timestamps.append(round(position / args.fps, 6))
 
-            dst = frame_dir / f"frame_{position:06d}.jpg"
-            action = materialize(entry.src, dst, link_mode, args.force, counters)
-            if action is None:
-                continue
-
-            frame_rows.append(
-                {
-                    "index": global_index,
-                    "episode_index": episode.episode_index,
-                    "frame_index": position,
-                    "source_frame": entry.source_frame,
-                    # 模糊分数是上游算好的原始值；is_blurry 是按本次 --blur-threshold
-                    # 标记的结论。帧本身完整保留，下游按需筛选。
-                    "blur_score": entry.blur_score,
-                    "is_blurry": entry.is_blurry,
-                    "timestamp": timestamp,
-                    "path": f"{frame_dir_rel}/frame_{position:06d}.jpg",
-                }
-            )
-            global_index += 1
-            kept += 1
-            dumped += 1
-            if dumped % 500 == 0:
-                logger.info("已落盘 %d / %d 帧", dumped, total_frames)
-
-        if kept == 0:
-            logger.warning("episode %d 没有任何可用帧，跳过", episode.episode_index)
-            continue
+        for camera in episode.cameras:
+            for position, entry in enumerate(episode.camera_frames[camera]):
+                dims_by_camera[camera][(entry.width, entry.height)] += 1
+                frame_rows.append(
+                    {
+                        "index": global_index,
+                        "episode_index": episode.episode_index,
+                        "frame_index": position,
+                        "source_frame": entry.source_frame,
+                        "camera": camera,
+                        # 模糊分数是上游算好的原始值；is_blurry 是本次阈值的结论。
+                        "blur_score": entry.blur_score,
+                        "is_blurry": entry.is_blurry,
+                        "timestamp": timestamps[position],
+                        "path": Path(os.path.relpath(entry.src, input_dir)).as_posix(),
+                    }
+                )
+                global_index += 1
 
         episode_rows.append(
             {
                 "episode_index": episode.episode_index,
                 "tasks": [],
-                "length": kept,
-                # 以下为扩展字段
+                "length": episode.length,
+                "episode": episode.episode,
                 "source_video": episode.source_video,
-                "frame_dir": frame_dir_rel,
+                "cameras": list(episode.cameras),
+                "source_videos": dict(episode.source_prefixes),
                 "fps": args.fps,
                 "source_fps": episode.source_fps,
                 "source_fps_origin": episode.source_fps_origin,
+                "source_fps_by_camera": dict(episode.source_fps_by_camera),
+                "source_fps_origin_by_camera": dict(episode.source_fps_origin_by_camera),
                 "first_source_frame": episode.frames[0].source_frame,
                 "last_source_frame": episode.frames[-1].source_frame,
-                # 同一视频被切成多段时，这两项说明这是第几段、共几段
                 "segment_index": episode.segment_index,
                 "segment_count": episode.segment_count,
             }
         )
         logger.info(
-            "episode %d（%s）完成：%d 帧 -> %s",
+            "episode %d（%s，%d 路相机）完成：%d 帧/相机",
             episode.episode_index,
-            episode.source_video,
-            kept,
-            frame_dir_rel,
+            episode.episode,
+            len(episode.cameras),
+            episode.length,
         )
 
     if not episode_rows:
@@ -909,40 +1070,55 @@ def main() -> int:
         return 1
 
     # ---- 写 meta/ ----
+    image_root = relative_image_root(input_dir, output_dir)
     try:
-        known = {row["episode_index"] for row in episode_rows}
-        episodes = [episode for episode in episodes if episode.episode_index in known]
-
         write_json(
             info_path,
-            build_info_json(args, camera_key, episodes, dims, len(frame_rows)),
+            build_info_json(
+                args,
+                cameras,
+                episodes,
+                dims_by_camera,
+                total_samples,
+                image_root,
+                actual_group_by,
+                source_root=images_meta.get("source_root"),
+                camera_names={
+                    **(images_meta.get("camera_names") or {}),
+                    **camera_names,
+                },
+            ),
         )
         write_jsonl(meta_dir / EPISODES_JSONL, episode_rows)
         write_jsonl(meta_dir / FRAMES_JSONL, frame_rows)
         # 没有任务标注，仍然生成空文件以保住结构
         write_jsonl(meta_dir / TASKS_JSONL, [])
         (meta_dir / "README.md").write_text(
-            build_readme(args, camera_key, counters, episodes), encoding="utf-8"
+            build_readme(args, cameras, counters, episodes), encoding="utf-8"
         )
     except OSError:
         logger.exception("写入 meta 文件失败：%s", meta_dir)
         return 1
 
-    if len(dims) > 1:
-        top = ", ".join(f"{w}x{h}×{n}" for (w, h), n in dims.most_common(5))
-        logger.warning("检测到多种图片尺寸，info.json 取众数；分布：%s", top)
+    for camera, dims in dims_by_camera.items():
+        if len(dims) > 1:
+            top = ", ".join(f"{w}x{h}×{n}" for (w, h), n in dims.most_common(5))
+            logger.warning(
+                "相机 %s 检测到多种图片尺寸，info.json 取众数；分布：%s",
+                camera,
+                top,
+            )
 
     logger.info("=== 完成 ===")
     logger.info(
-        "episodes=%d frames=%d 落盘方式=%s 链接=%d 复制=%d 已存在=%d",
+        "episodes=%d samples=%d camera_rows=%d cameras=%s image_root=%s",
         len(episode_rows),
+        total_samples,
         len(frame_rows),
-        link_mode,
-        counters.linked,
-        counters.copied,
-        counters.already_present,
+        ", ".join(cameras),
+        image_root,
     )
-    logger.info("输出目录：%s（耗时 %.2fs）", output_dir.resolve(), time.time() - start_ts)
+    logger.info("清单目录：%s（耗时 %.2fs）", output_dir.resolve(), time.time() - start_ts)
     return 0
 
 

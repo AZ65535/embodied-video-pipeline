@@ -260,13 +260,16 @@ def _rerun_fn(
     fps,
     blur_threshold,
     max_episode_seconds,
-    link_mode,
     camera,
     task,
     vcodec,
     repo_id,
     threshold,
     force,
+    group_by="file",
+    camera_names="",
+    dataset_id="",
+    robot_type="",
 ):
     fallback = h.config_from_form(
         input_dir,
@@ -279,12 +282,15 @@ def _rerun_fn(
         fps,
         blur_threshold,
         max_episode_seconds,
-        link_mode,
         camera,
         task,
         vcodec,
         repo_id,
         "normal",
+        group_by,
+        camera_names,
+        dataset_id,
+        robot_type,
     )
     config = h.config_for_format_rerun(
         fallback,
@@ -370,13 +376,22 @@ def build_ui():
                             max_episode_seconds = gr.Number(
                                 label="episode 时长上限（秒）", value=60
                             )
-                            link_mode = gr.Dropdown(
-                                label="落盘方式",
-                                choices=["auto", "hardlink", "symlink", "copy"],
-                                value="auto",
+                            group_by = gr.Dropdown(
+                                label="分组方式",
+                                choices=[
+                                    ("file：每个 mp4 一集", "file"),
+                                    ("dir：同目录多相机一集", "dir"),
+                                ],
+                                value="file",
                             )
                             camera = gr.Textbox(
-                                label="相机名", value=h.DEFAULT_CAMERA
+                                label="相机名（file 模式）",
+                                value=h.DEFAULT_CAMERA,
+                            )
+                            camera_names = gr.Textbox(
+                                label="相机名映射 JSON（dir 模式，可选）",
+                                value="",
+                                info="filename stem -> camera name；留空则用文件名",
                             )
                             task = gr.Textbox(label="任务标注", value="")
                             vcodec = gr.Textbox(
@@ -386,6 +401,15 @@ def build_ui():
                             )
                             repo_id = gr.Textbox(
                                 label="repo-id", value=h.DEFAULT_REPO_ID
+                            )
+                            dataset_id = gr.Textbox(
+                                label="dataset-id（可选）",
+                                value="",
+                                info="留空则沿用 repo-id；多数据集场景建议填写",
+                            )
+                            robot_type = gr.Textbox(
+                                label="robot-type（可选）",
+                                value="",
                             )
 
                     with gr.Column(scale=1):
@@ -488,12 +512,15 @@ def build_ui():
             fps,
             blur_threshold,
             max_episode_seconds,
-            link_mode,
             camera,
             task,
             vcodec,
             repo_id,
             mode,
+            group_by,
+            camera_names,
+            dataset_id,
+            robot_type,
         ]
         review_inputs = [output_base, threshold, band, video_filter, sample_size]
         rerun_inputs = [
@@ -504,13 +531,16 @@ def build_ui():
             fps,
             blur_threshold,
             max_episode_seconds,
-            link_mode,
             camera,
             task,
             vcodec,
             repo_id,
             threshold,
             rerun_force,
+            group_by,
+            camera_names,
+            dataset_id,
+            robot_type,
         ]
 
         for component in form_inputs:

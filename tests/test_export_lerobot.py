@@ -71,9 +71,14 @@ def episodes_of(dataset_dir: Path):
     )
 
 
+def image_root_of(dataset_dir: Path) -> Path:
+    """从 info.json 解析第一步图片目录。"""
+    return ex.resolve_image_root(dataset_dir, ex.load_info(dataset_dir))
+
+
 def break_one_frame(dataset_dir: Path) -> None:
     """弄丢一个帧文件，把流程挡在落盘之前。"""
-    next((dataset_dir / "videos").rglob("*.jpg")).unlink()
+    next(image_root_of(dataset_dir).rglob("*.jpg")).unlink()
 
 
 @pytest.fixture
@@ -286,7 +291,15 @@ def grid_episode(fps, source_frames, episode_index=0):
         }
         for position, source_frame in enumerate(source_frames)
     ]
-    return ex.EpisodeFrames(episode_index, "v1", fps, rows)
+    return ex.EpisodeFrames(
+        episode_index=episode_index,
+        episode="v1",
+        source_video="v1",
+        cameras=["front"],
+        source_fps=fps,
+        frames_by_camera={"front": rows},
+        length=len(rows),
+    )
 
 
 class FakeEncoder:
@@ -371,7 +384,15 @@ def test_grid_check_skips_the_gap_check_without_source_frame():
         {"episode_index": 0, "frame_index": i, "blur_score": 250.0, "path": f"f{i}.jpg"}
         for i in range(3)
     ]
-    episode = ex.EpisodeFrames(0, "v1", 30.0, rows)
+    episode = ex.EpisodeFrames(
+        episode_index=0,
+        episode="v1",
+        source_video="v1",
+        cameras=["front"],
+        source_fps=30.0,
+        frames_by_camera={"front": rows},
+        length=len(rows),
+    )
     assert ex.check_frame_grid([episode], fps=5) == []
 
 
@@ -447,7 +468,7 @@ def test_precheck_requires_actions_for_every_source_video(built_dataset, fixture
     write_actions(dataset_dir, {"1": 20})  # 只给 1，2 没有
     actions = ex.load_actions(dataset_dir)
     _, problems = ex.precheck_frames(
-        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+        episodes_of(dataset_dir), image_root_of(dataset_dir), *fixture_hw, actions=actions
     )
     assert problems and all("没有动作文件" in p for p in problems)
 
@@ -458,7 +479,7 @@ def test_precheck_detects_frame_beyond_action_range(built_dataset, fixture_hw, w
     write_actions(dataset_dir, {"1": 3})  # 动作只有 3 行
     actions = ex.load_actions(dataset_dir)
     _, problems = ex.precheck_frames(
-        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+        episodes_of(dataset_dir), image_root_of(dataset_dir), *fixture_hw, actions=actions
     )
     assert problems and any("超出动作范围" in p for p in problems)
 
@@ -468,7 +489,7 @@ def test_precheck_passes_when_actions_cover_every_frame(built_dataset, fixture_h
     write_actions(dataset_dir, {"1": 40})
     actions = ex.load_actions(dataset_dir)
     total, problems = ex.precheck_frames(
-        episodes_of(dataset_dir), dataset_dir, *fixture_hw, actions=actions
+        episodes_of(dataset_dir), image_root_of(dataset_dir), *fixture_hw, actions=actions
     )
     assert (total, problems) == (3, [])
 
@@ -476,7 +497,9 @@ def test_precheck_passes_when_actions_cover_every_frame(built_dataset, fixture_h
 def test_precheck_passes_on_good_frames(built_dataset, fixture_hw):
     dataset_dir = built_dataset({"1": [0, 6, 12]})
     height, width = fixture_hw
-    total, problems = ex.precheck_frames(episodes_of(dataset_dir), dataset_dir, height, width)
+    total, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), image_root_of(dataset_dir), height, width
+    )
     assert (total, problems) == (3, [])
 
 
@@ -484,7 +507,9 @@ def test_precheck_detects_missing_file(built_dataset, fixture_hw):
     dataset_dir = built_dataset({"1": [0, 6]})
     break_one_frame(dataset_dir)
     height, width = fixture_hw
-    total, problems = ex.precheck_frames(episodes_of(dataset_dir), dataset_dir, height, width)
+    total, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), image_root_of(dataset_dir), height, width
+    )
     assert total == 2
     assert len(problems) == 1 and "帧文件不存在" in problems[0]
 
@@ -493,7 +518,9 @@ def test_precheck_detects_size_mismatch(built_dataset, fixture_hw):
     """尺寸不一致必须在这里拦下 —— 放进 lerobot 会在写到一半时炸，留下半成品。"""
     dataset_dir = built_dataset({"1": [0, 6, 12]}, mixed_sizes=True)
     height, width = fixture_hw
-    _, problems = ex.precheck_frames(episodes_of(dataset_dir), dataset_dir, height, width)
+    _, problems = ex.precheck_frames(
+        episodes_of(dataset_dir), image_root_of(dataset_dir), height, width
+    )
     assert problems and all("尺寸不符" in p for p in problems)
 
 
@@ -685,3 +712,235 @@ def test_force_rebuild_is_clean(built_dataset, run_export, tmp_path):
     assert run_export("--input", dataset_dir, "--output", out, "--force") == 0
     assert not (out / "stale.txt").exists()
     assert len(LeRobotDataset("local/embodied-videos", root=out)) == 2
+
+
+# --------------------------------------------------------------------------
+# 多相机：相机解析、分组、预检
+# --------------------------------------------------------------------------
+
+
+def multi_episode(
+    episode_index=0,
+    episode="ep1",
+    cameras=("a", "b"),
+    source_frames=(0, 6),
+    source_video="a",
+):
+    frames_by_camera = {}
+    for camera in cameras:
+        frames_by_camera[camera] = [
+            {
+                "episode_index": episode_index,
+                "frame_index": position,
+                "source_frame": source_frame,
+                "timestamp": round(position * 6 / 30.0, 6),
+                "camera": camera,
+                "blur_score": 250.0,
+                "path": f"{episode}_{camera}_{position}.jpg",
+            }
+            for position, source_frame in enumerate(source_frames)
+        ]
+    return ex.EpisodeFrames(
+        episode_index=episode_index,
+        episode=episode,
+        source_video=source_video,
+        cameras=list(cameras),
+        source_fps=30.0,
+        frames_by_camera=frames_by_camera,
+        length=len(source_frames),
+    )
+
+
+def test_resolve_cameras_uses_declared_order_and_shapes():
+    info = {
+        "features": {
+            "observation.images.b": {"shape": [10, 20, 3]},
+            "observation.images.a": {"shape": [30, 40, 3]},
+        },
+        "extras": {"cameras": ["b", "a"]},
+    }
+    cameras = ex.resolve_cameras(info)
+    assert [camera.name for camera in cameras] == ["b", "a"]
+    assert [(camera.height, camera.width) for camera in cameras] == [(10, 20), (30, 40)]
+
+
+def test_resolve_cameras_falls_back_to_feature_keys():
+    info = {
+        "features": {
+            "observation.images.cam10": {"shape": [8, 8, 3]},
+            "observation.images.cam2": {"shape": [8, 8, 3]},
+        }
+    }
+    assert [camera.name for camera in ex.resolve_cameras(info)] == ["cam2", "cam10"]
+
+
+def test_resolve_cameras_rejects_camera_override_for_multi_camera_info():
+    info = {
+        "features": {
+            "observation.images.a": {"shape": [8, 8, 3]},
+            "observation.images.b": {"shape": [8, 8, 3]},
+        },
+        "extras": {"cameras": ["a", "b"]},
+    }
+    with pytest.raises(ValueError, match="多个相机"):
+        ex.resolve_cameras(info, override="a")
+
+
+def test_build_features_multi_camera_has_blur_vector():
+    cameras = [
+        ex.CameraSpec("a", "observation.images.a", 48, 64),
+        ex.CameraSpec("b", "observation.images.b", 24, 32),
+    ]
+    features = ex.build_features(cameras)
+    assert features["observation.images.a"]["shape"] == (48, 64, 3)
+    assert features["observation.images.b"]["shape"] == (24, 32, 3)
+    assert features[ex.BLUR_SCORE_KEY]["shape"] == (2,)
+    assert features[ex.BLUR_SCORE_KEY]["names"] == ["a", "b"]
+
+
+def test_group_episodes_aggregates_camera_rows_by_position():
+    rows = []
+    for camera in ("b", "a"):
+        for position, source_frame in enumerate((0, 6, 12)):
+            rows.append(
+                {
+                    "episode_index": 0,
+                    "frame_index": position,
+                    "source_frame": source_frame,
+                    "timestamp": position * 0.2,
+                    "camera": camera,
+                    "blur_score": 250.0,
+                    "path": f"x_{camera}_{position}.jpg",
+                }
+            )
+    episodes = [
+        {
+            "episode_index": 0,
+            "episode": "ep1",
+            "source_video": "a",
+            "cameras": ["a", "b"],
+            "length": 3,
+            "source_fps": 30.0,
+        }
+    ]
+    grouped = ex.group_episodes(rows, episodes)
+    assert len(grouped) == 1
+    episode = grouped[0]
+    assert episode.episode == "ep1"
+    assert episode.cameras == ["a", "b"]
+    assert episode.length == 3
+    assert [row["source_frame"] for row in episode.frames_by_camera["a"]] == [0, 6, 12]
+    assert [row["source_frame"] for row in episode.frames_by_camera["b"]] == [0, 6, 12]
+
+
+def test_group_episodes_rejects_desynchronized_cameras():
+    rows = [
+        {
+            "episode_index": 0,
+            "frame_index": 0,
+            "source_frame": 0,
+            "camera": "a",
+            "blur_score": 1.0,
+            "path": "a0.jpg",
+        },
+        {
+            "episode_index": 0,
+            "frame_index": 0,
+            "source_frame": 3,
+            "camera": "b",
+            "blur_score": 1.0,
+            "path": "b0.jpg",
+        },
+    ]
+    episodes = [{"episode_index": 0, "cameras": ["a", "b"], "length": 1}]
+    with pytest.raises(ValueError, match="不同步"):
+        ex.group_episodes(rows, episodes)
+
+
+def test_group_episodes_rejects_missing_declared_camera():
+    rows = [
+        {
+            "episode_index": 0,
+            "frame_index": 0,
+            "source_frame": 0,
+            "camera": "a",
+            "blur_score": 1.0,
+            "path": "a0.jpg",
+        }
+    ]
+    episodes = [{"episode_index": 0, "cameras": ["a", "b"], "length": 1}]
+    with pytest.raises(ValueError, match="缺少.*b"):
+        ex.group_episodes(rows, episodes)
+
+
+def test_group_episodes_legacy_rows_without_camera_use_first_camera():
+    rows = [
+        {
+            "episode_index": 0,
+            "frame_index": 0,
+            "source_frame": 0,
+            "blur_score": 1.0,
+            "path": "a0.jpg",
+        }
+    ]
+    grouped = ex.group_episodes(
+        rows, [{"episode_index": 0, "source_video": "v", "length": 1}]
+    )
+    assert grouped[0].cameras == ["front"]
+    assert grouped[0].episode == "v"
+    assert grouped[0].has_episode_key is False
+
+
+def test_action_key_for_new_manifest_does_not_fall_back_to_source_video():
+    episode = multi_episode(source_video="a")
+    actions = {"a": (np.zeros((10, 8), dtype=np.float32),) * 2}
+    assert ex.action_key_for(episode, actions) is None
+    problem = ex.action_problem(episode, episode.frames[0], actions)
+    assert "没有动作文件" in problem
+
+
+def test_action_key_for_legacy_manifest_falls_back_to_source_video():
+    episode = multi_episode(source_video="a")
+    episode.has_episode_key = False
+    state = np.zeros((10, 8), dtype=np.float32)
+    actions = {"a": (state, state)}
+    assert ex.action_key_for(episode, actions) == "a"
+    assert ex.action_problem(episode, episode.frames[0], actions) is None
+
+
+def test_precheck_frames_checks_every_camera(tmp_path, tiny_jpegs):
+    root = tmp_path / "images"
+    root.mkdir()
+    width, height = pc.probe_jpeg(tiny_jpegs[0])
+    for camera in ("a", "b"):
+        (root / f"ep1_{camera}_0.jpg").write_bytes(tiny_jpegs[0].read_bytes())
+    episode = multi_episode(source_frames=(0,))
+    for camera in ("a", "b"):
+        episode.frames_by_camera[camera][0]["path"] = f"ep1_{camera}_0.jpg"
+    cameras = [
+        ex.CameraSpec("a", "observation.images.a", height, width),
+        ex.CameraSpec("b", "observation.images.b", height, width),
+    ]
+    total, problems = ex.precheck_frames([episode], root, cameras)
+    assert (total, problems) == (1, [])
+
+    (root / "ep1_b_0.jpg").unlink()
+    total, problems = ex.precheck_frames([episode], root, cameras)
+    assert total == 1
+    assert problems and "相机 b" in problems[0] and "不存在" in problems[0]
+
+
+def test_precheck_frames_detects_missing_camera_in_episode(tmp_path, tiny_jpegs):
+    root = tmp_path / "images"
+    root.mkdir()
+    width, height = pc.probe_jpeg(tiny_jpegs[0])
+    (root / "ep1_a_0.jpg").write_bytes(tiny_jpegs[0].read_bytes())
+    episode = multi_episode(cameras=("a",), source_frames=(0,))
+    episode.frames_by_camera["a"][0]["path"] = "ep1_a_0.jpg"
+    cameras = [
+        ex.CameraSpec("a", "observation.images.a", height, width),
+        ex.CameraSpec("b", "observation.images.b", height, width),
+    ]
+    total, problems = ex.precheck_frames([episode], root, cameras)
+    assert total == 0
+    assert problems and "缺少 ['b']" in problems[0]

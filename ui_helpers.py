@@ -83,11 +83,14 @@ class UiConfig:
     fps: int = 5
     blur_threshold: float = DEFAULT_BLUR_THRESHOLD
     max_episode_seconds: float = 60.0
-    link_mode: str = "auto"
     camera: str = DEFAULT_CAMERA
     task: str = ""
     vcodec: str = "h264"
     repo_id: str = DEFAULT_REPO_ID
+    group_by: str = "file"  # file | dir
+    camera_names: str = ""  # 相机名映射 JSON 路径；空=不指定
+    dataset_id: str = ""  # 空=沿用 repo_id
+    robot_type: str = ""  # 空=export_lerobot 的默认 unknown
     selected_steps: Tuple[int, ...] = (1, 2, 3)
     mode: str = "normal"  # normal | force | skip-existing
 
@@ -143,12 +146,15 @@ def config_from_form(
     fps,
     blur_threshold,
     max_episode_seconds,
-    link_mode,
     camera,
     task,
     vcodec,
     repo_id,
     mode,
+    group_by="file",
+    camera_names="",
+    dataset_id="",
+    robot_type="",
 ) -> UiConfig:
     """把 Gradio 表单值转成配置；非法数字会变成可被校验捕获的值。"""
     selected = tuple(
@@ -164,11 +170,14 @@ def config_from_form(
         fps=_as_int(fps, 0),
         blur_threshold=_as_float(blur_threshold, 0.0),
         max_episode_seconds=_as_float(max_episode_seconds, -1.0),
-        link_mode=str(link_mode or "").strip(),
         camera=str(camera or "").strip(),
         task=str(task or ""),
         vcodec=str(vcodec or "").strip(),
         repo_id=str(repo_id or "").strip(),
+        group_by=str(group_by or "file").strip() or "file",
+        camera_names=str(camera_names or "").strip(),
+        dataset_id=str(dataset_id or "").strip(),
+        robot_type=str(robot_type or "").strip(),
         selected_steps=selected,
         mode=str(mode or "normal"),
     )
@@ -198,11 +207,14 @@ def to_namespace(config: UiConfig, paths: ResolvedPaths) -> argparse.Namespace:
         fps=config.fps,
         blur_threshold=config.blur_threshold,
         max_episode_seconds=config.max_episode_seconds,
-        link_mode=config.link_mode,
         camera=config.camera,
         task=config.task,
         vcodec=config.vcodec,
         repo_id=config.repo_id,
+        group_by=config.group_by,
+        camera_names=config.camera_names or None,
+        dataset_id=config.dataset_id or None,
+        robot_type=config.robot_type or None,
         force=config.mode == "force",
         skip_existing=config.mode == "skip-existing",
         dry_run=False,
@@ -238,12 +250,26 @@ def _validate_plan(
         errors.append("episode 时长上限不能为负数（0 表示不切分）。")
     if not config.repo_id:
         errors.append("repo-id 不能为空。")
-    if not config.camera:
-        errors.append("相机名不能为空。")
+    if config.group_by not in {"file", "dir"}:
+        errors.append(f"未知的分组方式：{config.group_by!r}")
+    if config.group_by == "file" and not config.camera:
+        errors.append("file 模式下相机名不能为空。")
     if not config.vcodec:
         errors.append("vcodec 不能为空。")
-    if config.link_mode not in {"auto", "hardlink", "symlink", "copy"}:
-        errors.append(f"未知的落盘方式：{config.link_mode!r}")
+    if config.camera_names:
+        names_path = rp.resolve_path(config.camera_names)
+        if not names_path.is_file():
+            errors.append(f"相机名映射文件不存在：{names_path}")
+    elif config.group_by == "dir":
+        warnings.append(
+            "dir 模式未提供相机名映射：相机名将直接使用 mp4 文件名（去后缀）。"
+        )
+    if (
+        config.group_by == "dir"
+        and config.camera
+        and config.camera != DEFAULT_CAMERA
+    ):
+        warnings.append("dir 模式下「相机名」输入被忽略；相机名来自文件名/映射。")
 
     for label, path in (
         ("输入视频目录", paths.input_dir),
@@ -290,12 +316,24 @@ def _validate_plan(
         info = _read_json(paths.dataset_dir / META_DIRNAME / INFO_JSON)
         if isinstance(info, dict):
             features = info.get("features")
-            camera_key = f"observation.images.{config.camera}"
-            if isinstance(features, dict) and camera_key not in features:
-                warnings.append(
-                    f"dataset/info.json 中没有相机特征 {camera_key}；"
-                    f"现有特征：{sorted(features)}"
-                )
+            if isinstance(features, dict):
+                image_keys = [
+                    key
+                    for key in features
+                    if isinstance(key, str)
+                    and key.startswith("observation.images.")
+                ]
+                if config.group_by == "file":
+                    camera_key = f"observation.images.{config.camera}"
+                    if camera_key not in features:
+                        warnings.append(
+                            f"dataset/info.json 中没有相机特征 {camera_key}；"
+                            f"现有特征：{sorted(features)}"
+                        )
+                elif not image_keys:
+                    warnings.append(
+                        "dataset/info.json 中没有任何 observation.images.* 相机特征。"
+                    )
 
     if 2 in running:
         meta = _read_json(paths.images_dir / IMAGES_META_FILENAME)
@@ -419,7 +457,8 @@ class DatasetSummary:
     blur_threshold: Optional[float] = None
     camera_key: Optional[str] = None
     shape: Optional[Tuple[int, int]] = None
-    link_mode: Optional[str] = None
+    cameras: List[Tuple[str, Optional[Tuple[int, int]]]] = field(default_factory=list)
+    image_root: Optional[str] = None
     episode_counts: Counter = field(default_factory=Counter)
     episode_frames: Counter = field(default_factory=Counter)
     fps_origins: Counter = field(default_factory=Counter)
@@ -535,24 +574,33 @@ def summarize_paths(paths: ResolvedPaths, steps: Sequence[rp.Step]) -> DatasetSu
         summary.fps = info.get("fps")
         extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
         summary.blur_threshold = extras.get("blur_score_threshold")
-        summary.link_mode = extras.get("link_mode")
+        image_root = extras.get("image_root")
+        summary.image_root = image_root if isinstance(image_root, str) else None
         features = info.get("features") if isinstance(info.get("features"), dict) else {}
-        camera_key = extras.get("camera_key")
-        if not isinstance(camera_key, str) or camera_key not in features:
-            camera_key = next(
-                (
-                    key
-                    for key in features
-                    if isinstance(key, str)
-                    and key.startswith("observation.images.")
-                ),
-                None,
+        declared = extras.get("cameras")
+        camera_names = [
+            name
+            for name in declared
+            if isinstance(name, str) and f"observation.images.{name}" in features
+        ] if isinstance(declared, list) else []
+        if not camera_names:
+            camera_names = [
+                key[len("observation.images.") :]
+                for key in features
+                if isinstance(key, str)
+                and key.startswith("observation.images.")
+            ]
+        for name in camera_names:
+            shape = features.get(f"observation.images.{name}", {}).get("shape")
+            dims = (
+                (shape[0], shape[1])
+                if isinstance(shape, list) and len(shape) >= 2
+                else None
             )
-        summary.camera_key = camera_key
-        if isinstance(camera_key, str):
-            shape = features.get(camera_key, {}).get("shape")
-            if isinstance(shape, list) and len(shape) >= 2:
-                summary.shape = (shape[0], shape[1])
+            summary.cameras.append((name, dims))
+        if summary.cameras:
+            summary.camera_key = f"observation.images.{summary.cameras[0][0]}"
+            summary.shape = summary.cameras[0][1]
 
     episodes_path = meta_dir / EPISODES_JSONL
     episode_rows: List[dict] = []
@@ -564,7 +612,7 @@ def summarize_paths(paths: ResolvedPaths, steps: Sequence[rp.Step]) -> DatasetSu
 
     if episode_rows:
         for row in episode_rows:
-            name = str(row.get("source_video", "?"))
+            name = str(row.get("episode") or row.get("source_video", "?"))
             summary.episode_counts[name] += 1
             length = row.get("length")
             if isinstance(length, int) and not isinstance(length, bool):
@@ -593,13 +641,17 @@ def summarize_paths(paths: ResolvedPaths, steps: Sequence[rp.Step]) -> DatasetSu
     _summarize_frames(meta_dir / FRAMES_JSONL, summary)
 
     if info is not None:
+        extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
+        expected_rows = extras.get("total_camera_rows")
+        if not isinstance(expected_rows, int) or isinstance(expected_rows, bool):
+            expected_rows = summary.total_frames
         if (
-            summary.total_frames is not None
+            expected_rows is not None
             and summary.frames_rows is not None
-            and summary.total_frames != summary.frames_rows
+            and expected_rows != summary.frames_rows
         ):
             summary.warnings.append(
-                f"info.json 记录 {summary.total_frames} 帧，"
+                f"info.json 记录 {expected_rows} 个相机帧行，"
                 f"但 frames.jsonl 实际有 {summary.frames_rows} 行。"
             )
         if (
@@ -616,11 +668,6 @@ def summarize_paths(paths: ResolvedPaths, steps: Sequence[rp.Step]) -> DatasetSu
     if summary.malformed_frame_lines:
         summary.warnings.append(
             f"frames.jsonl 有 {summary.malformed_frame_lines} 行无法解析。"
-        )
-    if summary.link_mode == "hardlink":
-        summary.warnings.append(
-            "hardlink 模式：dataset 与 images 共享同一批 inode，"
-            "下面两者的表观大小会重复计算。"
         )
 
     for step in steps:
@@ -674,12 +721,18 @@ def render_summary(summary: DatasetSummary) -> str:
             f"**fps**：{summary.fps}　"
             f"**阈值**：{summary.blur_threshold}"
         )
-    if summary.camera_key:
+    if len(summary.cameras) > 1:
+        lines.append(f"- **相机**：{len(summary.cameras)} 路")
+        for name, dims in summary.cameras:
+            # info.json 的 shape 是 [height, width, channels]；展示习惯是宽x高
+            shape = f"{dims[1]}x{dims[0]}" if dims else "未知"
+            lines.append(f"  - `observation.images.{_md_cell(name)}`：{shape}")
+    elif summary.camera_key:
         # info.json 的 shape 是 [height, width, channels]；展示习惯是宽x高
         shape = f"{summary.shape[1]}x{summary.shape[0]}" if summary.shape else "未知"
         lines.append(f"- **相机**：{summary.camera_key}　**尺寸（宽x高）**：{shape}")
-    if summary.link_mode:
-        lines.append(f"- **落盘方式**：{summary.link_mode}")
+    if summary.image_root:
+        lines.append(f"- **图片目录**：{summary.image_root}")
     if summary.frames_rows is not None:
         lines.append(
             f"- **帧清单**：{summary.frames_rows} 行，"
@@ -690,9 +743,9 @@ def render_summary(summary: DatasetSummary) -> str:
 
     if summary.episode_counts:
         lines.append("")
-        lines.append("**每源视频**")
+        lines.append("**每个 episode**")
         lines.append("")
-        lines.append("| source_video | episodes | frames |")
+        lines.append("| episode | segments | frames |")
         lines.append("|---|---:|---:|")
         for name in sorted(summary.episode_counts, key=natural_key):
             lines.append(
@@ -1424,25 +1477,26 @@ def config_for_format_rerun(
         if isinstance(fps, int) and fps > 0:
             changes["fps"] = fps
 
-        camera_key = extras.get("camera_key")
-        if not isinstance(camera_key, str):
-            camera_key = next(
-                (
-                    key
-                    for key in features
-                    if isinstance(key, str)
-                    and key.startswith("observation.images.")
-                ),
-                None,
-            )
-        if isinstance(camera_key, str) and camera_key.startswith(
-            "observation.images."
-        ):
-            changes["camera"] = camera_key[len("observation.images.") :]
+        group_by = extras.get("group_by")
+        if group_by in {"file", "dir"}:
+            changes["group_by"] = group_by
 
-        link_mode = extras.get("link_mode")
-        if link_mode in {"auto", "hardlink", "symlink", "copy"}:
-            changes["link_mode"] = link_mode
+        if group_by != "dir":
+            camera_key = extras.get("camera_key")
+            if not isinstance(camera_key, str):
+                camera_key = next(
+                    (
+                        key
+                        for key in features
+                        if isinstance(key, str)
+                        and key.startswith("observation.images.")
+                    ),
+                    None,
+                )
+            if isinstance(camera_key, str) and camera_key.startswith(
+                "observation.images."
+            ):
+                changes["camera"] = camera_key[len("observation.images.") :]
 
         max_seconds = extras.get("max_episode_seconds")
         if isinstance(max_seconds, (int, float)) and not isinstance(max_seconds, bool):

@@ -11,18 +11,23 @@ videos/*.mp4 ──①clean_video.py──▶ output/images/*.jpg ──②forma
 ```
 
 **动作那一支是可选的**：有动作记录，产物里就带上 `action` / `observation.state`，数据集
-才谈得上训练策略；没有，就只产 observation（能训世界模型那一类，见「已知限制 1」）。
+才谈得上训练策略；没有，就只产 observation（能训世界模型那一类，见「已知限制」）。
 
 面向**数据量大、录制时间长**的素材设计：帧不嵌进 parquet（那有两个会爆的硬限制，见第三步），
 长视频自动切成时长有上限的 episode。
+
+支持同一目录下的多个 mp4 作为**同一集的多路同步相机**（`--group-by dir`），也支持每个
+mp4 各自成集（`--group-by file`，默认）。每个导出结果都是**同构**数据集：内部相机集合、
+分辨率、动作维度固定；不同数据集之间可以不同。
 
 | 步骤 | 脚本 | 职责 | 依赖 |
 |---|---|---|---|
 | 1 | `clean_video.py` | 抽帧、记录每帧的模糊分数 | OpenCV |
 | 2 | `format_dataset.py` | 生成帧清单，按阈值标记模糊帧 | 标准库 |
 | — | `import_actions.py` | **可选**：把外部动作记录转成侧车，供第三步消费 | numpy（droid 格式另需 h5py） |
-| 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集 | lerobot |
+| 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集，并写 `dataset_manifest.json` | lerobot |
 | — | `run_pipeline.py` | 一条命令串行执行三步 | 标准库 |
+| — | `build_dataset_index.py` | 扫描多个数据集，生成可重建的 `datasets.json` | 标准库 |
 | — | `ui.py` | **可选**：本地网页界面（运行 + 模糊复核） | gradio（`requirements-ui.txt`） |
 
 第二步的产物 `dataset/` 是**中间产物**，供第三步消费。它可读、可查、便于调试，但不是
@@ -35,7 +40,8 @@ LeRobot 数据集。`import_actions.py` 排在第二步之后、第三步之前�
 
 **模糊帧一律保留，只做标记。** 被丢弃的帧会让时间轴出现空洞，而 lerobot 的整套时序逻辑
 都假设帧等间隔排列 —— 空洞会让它的 `delta_timestamps` 静默取到错误的时间点。因此过滤是
-**下游的事**：数据集里带一列 `blur_score`，用不用、阈值设多少，由消费方决定。
+**下游的事**：数据集里带一列 `blur_score`（每帧一个长度 C 的向量，C=相机数），用不用、
+阈值设多少，由消费方决定。
 阈值参数在第二步（`--blur-threshold`），第一步不带这个参数。
 
 ## 环境
@@ -78,6 +84,14 @@ python run_pipeline.py --input videos
 videos/ ──①──▶ output/images/ ──②──▶ dataset/ ──③──▶ lerobot_dataset/
 ```
 
+多相机素材（同一目录下的 mp4 是同集的不同视角）：
+
+```bash
+python run_pipeline.py --input videos --group-by dir \
+    --camera-names names.json \
+    --dataset-id my_multicam --robot-type droid
+```
+
 任何一步失败都会立刻停下，已生成的产物保留；修好后可以接着跑。常用开关：
 
 | 参数 | 说明 |
@@ -87,8 +101,11 @@ videos/ ──①──▶ output/images/ ──②──▶ dataset/ ──③�
 | `--dry-run` | 只打印将执行的命令，不执行 |
 | `--fps` | 处理帧率，第一步与第二步共用（默认 5） |
 | `--output` / `--dataset` / `--lerobot` | 三个产物的目录（默认 output / dataset / lerobot_dataset） |
-| `--blur-threshold` / `--max-episode-seconds` / `--link-mode` | 透传给第二步 |
-| `--camera` / `--task` / `--vcodec` / `--repo-id` | 透传给第三步（`--camera` 同时用于第二步） |
+| `--blur-threshold` / `--max-episode-seconds` | 透传给第二步 |
+| `--group-by {file,dir}` | `file`=每个 mp4 一集；`dir`=同目录 mp4 是同集多相机（默认 `file`） |
+| `--camera-names names.json` | dir 模式下把序列号映射成语义相机名 |
+| `--camera` / `--task` / `--vcodec` / `--repo-id` | 透传给第三步（`--camera` 仅 file 模式） |
+| `--dataset-id` / `--robot-type` | 透传给第三步，写入数据集 manifest |
 
 需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面的步骤脚本和辅助工具。
 
@@ -101,7 +118,7 @@ python ui.py
 
 浏览器打开终端打印的 `http://127.0.0.1:7860`（端口被占用时会顺延）。两个页面：
 
-- **运行管线**：填输入/输出目录，勾选要跑的步骤，运行/停止，实时看日志。第 2 步完成后会自动刷新数据集摘要（episode 数、帧数、阈值、尺寸、每源视频分布、磁盘占用），也可以在跑第 3 步前手动刷新做预检。
+- **运行管线**：填输入/输出目录，选择 `file`/`dir` 分组方式，勾选要跑的步骤，运行/停止，实时看日志。第 2 步完成后会自动刷新数据集摘要（episode 数、同步采样数、阈值、每路相机尺寸、每个 episode 的分布、磁盘占用），也可以在跑第 3 步前手动刷新做预检。
 - **模糊复核**：读取 `<第 1 步输出根目录>/images/_scores.jsonl`，按分数浏览缩略图，调整阈值实时看各视频的标记比例；确认后可一键用该阈值重跑第 2 步（只改 `is_blurry`，不删帧）。
 
 界面只监听 `127.0.0.1`，不上传数据；Gradio 是可选依赖，不装也不影响三步 CLI 和 `run_pipeline.py`。若 pip 镜像超时，加 `-i https://pypi.org/simple/`。部分 Windows 环境的系统代理会拦截 Gradio 的 localhost 健康检查，`ui.py` 已自动把 `127.0.0.1,localhost` 加入 `NO_PROXY`。
@@ -119,6 +136,9 @@ python clean_video.py --input ./videos --output ./output --fps 5
 | `--input` / `-i` | 必填 | 视频目录，**递归**扫描 `.mp4`（大小写不敏感） |
 | `--output` / `-o` | `output` | 图片落在 `OUTPUT/images/` |
 | `--fps` | `5` | 目标采样帧率 |
+| `--group-by` | `file` | `file`：每个 mp4 一集；`dir`：同一目录的 mp4 是同集多相机 |
+| `--camera` | `front` | file 模式下的相机名（dir 模式不要传） |
+| `--camera-names` | 无 | JSON：`{"文件名去后缀": "相机名"}`；dir 模式可把序列号映射成语义名 |
 
 **这里没有阈值参数。** 第一步是纯机械操作：解码、按目标帧率采样、算每帧的 Laplacian
 方差、全部存盘。不做任何取舍判断，因此这一步跑完的产物是不可逆素材的完整保留
@@ -128,6 +148,35 @@ python clean_video.py --input ./videos --output ./output --fps 5
 中位数不需要阈值就能看出素材有多模糊。
 
 **产物**：`output/images/{前缀}_frame_{原始帧号:06d}.jpg`、`_meta.json`、`_scores.jsonl`。
+
+### 多相机分组
+
+默认 `--group-by file`：一个 mp4 就是一个 episode，相机名为 `front`，行为与单相机时代一致。
+
+`--group-by dir` 把**同一父目录**下的 mp4 视为同一集的多路视角，文件名（去后缀）就是
+默认相机名：
+
+```
+videos/AUTOLab/episode_001/
+├── 18026681.mp4     # 相机 18026681
+├── 22008760.mp4     # 相机 22008760
+├── 24400334.mp4     # 相机 24400334
+└── trajectory.h5
+```
+
+如果输入目录本身就是一集（根目录下直接放 mp4），episode 键是 `_root`。相机名建议用
+`--camera-names` 映射成语义名：
+
+```json
+{"18026681": "cam_1", "22008760": "cam_2", "24400334": "cam_3"}
+```
+
+**同一个数据集内所有 episode 的相机集合必须一致**（lerobot 只有一套全局 features）。
+不同实验室的序列号不同时，要么用映射统一，要么拆成多个数据集 —— 不要指望管线自动猜。
+
+**同步是严格按帧的**：同一集各相机的采样帧数、`source_frame` 序列、原始 fps 必须完全一致；
+管线不做插值、补齐或时间戳对齐。任何一项不一致都会在第一步/第二步报错，而不是产出错位的
+数据集。相机在最终数据集中的顺序是自然排序后的 `cameras` 列表顺序。
 
 ### 输出名前缀
 
@@ -152,8 +201,8 @@ python clean_video.py --input ./videos --output ./output --fps 5
 这样连续的（**不跳号**）。
 
 这个信息只在此处出现一次。`format_dataset.py` 会把它转存进 `meta/frames.jsonl` 的
-`source_frame` 字段，之后文件按 episode 内位置重命名。丢失它意味着真实时间轴无法还原。
-一旦有帧缺号，时间轴就有空洞，`delta_timestamps` 会开始取错帧。
+`source_frame` 字段；图片不再复制或重命名，清单直接引用原文件名。丢失它意味着真实
+时间轴无法还原。一旦有帧缺号，时间轴就有空洞，`delta_timestamps` 会开始取错帧。
 
 ### `_scores.jsonl`
 
@@ -169,16 +218,29 @@ python clean_video.py --input ./videos --output ./output --fps 5
 
 ### `_meta.json`
 
-记录处理参数和每个视频的原始帧率，供第二步读取：
+记录处理参数、相机分组和每个视频的原始帧率，供第二步读取：
 
 ```json
 {
-  "format": 2,
+  "format": 3,
   "tool": "clean_video.py",
   "target_fps": 5,
+  "group_by": "dir",
+  "source_root": "D:/videos",
+  "cameras": ["cam_1", "cam_2"],
+  "camera_names": {"18026681": "cam_1", "22008760": "cam_2"},
+  "episodes": {
+    "episode_001": {
+      "episode_dir": "AUTOLab/episode_001",
+      "cameras": {"cam_1": "AUTOLab_episode_001_18026681",
+                  "cam_2": "AUTOLab_episode_001_22008760"}
+    }
+  },
   "videos": {
-    "1": {"orig_fps": 30.00005, "frame_step": 6, "sampled": 1000,
-          "score_median": 168.7, "elapsed": 56.288}
+    "AUTOLab_episode_001_18026681": {
+      "orig_fps": 60.0, "frame_step": 12, "sampled": 40,
+      "source_stem": "18026681", "episode": "episode_001", "camera": "cam_1"
+    }
   }
 }
 ```
@@ -200,12 +262,12 @@ python format_dataset.py --input output/images --output dataset
 | `--input` / `-i` | `output/images` | 上一步的图片目录 |
 | `--output` / `-o` | `dataset` | 输出目录 |
 | `--fps` | `5` | 应与第一步一致 |
-| `--camera` | `front` | 生成 `observation.images.<camera>` |
+| `--group-by` | 读 `_meta.json` | 显式值与第一步记录不一致时报错 |
+| `--camera` | `front` | file 模式下的相机名；dir 模式不要传 |
+| `--camera-names` | 读 `_meta.json` | 相机名映射；同名条目会覆盖第一步记录 |
 | `--blur-threshold` | `100` | 低于此分数在清单里标为模糊。**只标记，不删帧** |
 | `--max-episode-seconds` | `60` | 单个 episode 的时长上限，超长的视频切成多段；`0` = 不切 |
-| `--link-mode` | `auto` | `auto`/`hardlink`/`symlink`/`copy` |
-| `--chunks-size` | `1000` | 每个 chunk 容纳多少 episode |
-| `--force` | 关 | 输出目录已存在时允许覆盖 |
+| `--force` | 关 | 已存在清单时允许覆盖 |
 | `--dry-run` | 关 | 只扫描出报告，不写任何文件 |
 
 **仅使用 Python 标准库**，不依赖 `lerobot` / `pyarrow` / 任何图像库 —— JPEG 宽高由脚本
@@ -213,13 +275,13 @@ python format_dataset.py --input output/images --output dataset
 
 ### 长视频会切成多个 episode
 
-**一个源视频不一定等于一个 episode。** 超过 `--max-episode-seconds` 的视频按固定长度
-切成连续小段，每段一个 episode；`source_frame` 不会因切分而重置，所以跨段的绝对位置
-不丢。
+**一段素材不一定等于一个 episode。** 超过 `--max-episode-seconds` 的视频（dir 模式下是
+整组同步相机）按固定长度切成连续小段，每段一个 episode；切分按位置范围同步作用于所有
+相机，`source_frame` 不会因切分而重置，所以跨段的绝对位置不丢。
 
 切分**不是**为了绕开某个技术限制（视频存储下没有单 episode 的大小上限），而是为了
 **训练时的样本独立性**：episode 越长，一个 batch 里来自同一段连续视频的样本越多，
-时间上越相关，对 SGD 不利。生态里常见 episode 是几秒到几十秒（[LeRobot 的 AL0HA 例子](https://huggingface.co/lerobot/act_aloha_sim_insertion_human/discussions/1)
+时间上越相关，对 SGD 不利。生态里常见 episode 是几秒到几十秒（[LeRobot 的 ALOHA 例子](https://huggingface.co/lerobot/act_aloha_sim_insertion_human/discussions/1)
 是 10 秒 / 500 帧），视频预训练管线通常在 5~240 秒之间截断。
 
 `timestamp` 相对**本段起点**计时（不是视频起点），与 lerobot 写的 `frame_index/fps`
@@ -238,26 +300,31 @@ python format_dataset.py --input output/images --output dataset
 
 ### 产物结构
 
-一个源视频对应一个或多个 episode（见上）。
+一个 episode 是一段（可能被切分的）同步多相机素材。file 模式下每个源视频是独立
+episode；dir 模式下同一目录的多路相机共享 `episode`。
 
 ```
 dataset/
-├── data/.gitkeep                     # 占位；上游这里放 parquet
-├── videos/chunk-000/observation.images.front/
-│   ├── episode_000000/frame_000000.jpg ...
-│   ├── episode_000001/ ...
-│   └── episode_000002/ ...
 └── meta/
-    ├── info.json          # 对齐上游字段，非标准信息全在 extras 里
-    ├── episodes.jsonl     # 一行一个 episode，含 segment_index / segment_count
-    ├── frames.jsonl       # 一行一帧，含 blur_score / is_blurry（本项目扩展）
+    ├── info.json          # 每路相机的 shape、fps、阈值、image_root、来源记录
+    ├── episodes.jsonl     # 一行一个 episode/segment，含 cameras / source_videos
+    ├── frames.jsonl       # 一行一个 (相机, 帧)，含 camera / blur_score / is_blurry / path
     ├── tasks.jsonl        # 任务标注，无标注时为空文件
-    └── README.md          # 自动生成，记录与上游 LeRobot 的逐项差异
+    ├── README.md          # 自动生成的清单说明
+    └── actions/           # 可选；import_actions.py 写入
 ```
 
-`info.json` 里的 `codebase_version` 是 `v2.0`，但**这不是最终交付物** —— 真正的
-LeRobot 数据集由第三步生成，格式为 v3.0。这里保留 LeRobot 风格的目录只是为了让中间
-产物易读、可对照。
+`frames.jsonl` 的同一帧位置在各相机行中共享 `episode_index` / `frame_index` /
+`source_frame` / `timestamp`；`index` 是全局行号，`path` / `blur_score` / `is_blurry`
+是每路相机各自的。因此 **`frames.jsonl` 的行数 = 同步采样数 × 相机数**；`info.json` 的
+`total_frames` 仍是同步采样数，`extras.total_camera_rows` 才是相机帧行数。
+
+**图片不复制、不链接到 `dataset/`。** `frames.jsonl` 的 `path` 是相对图片目录的文件名；
+图片目录记录在 `info.json` 的 `extras.image_root`（默认是 `../output/images`）。
+第三步按这个路径回读原图。
+
+`info.json` 的 `codebase_version` 是 `v3.0-manifest`，表示这是纯清单中间产物；真正的
+LeRobot 数据集由第三步生成（v3.0）。
 
 ### 原始帧率的三级来源
 
@@ -275,14 +342,6 @@ LeRobot 数据集由第三步生成，格式为 v3.0。这里保留 LeRobot 风�
 脚本同时做**交叉校验**：`_meta.json` 记录的帧率对应的步长应当等于从帧号反推的步长，
 不符则告警（通常意味着素材与记录对不上）；各视频原始帧率不统一时也会主动检出。
 
-### 文件落盘方式
-
-默认 `auto`：硬链接 → 软链接 → 复制，依次尝试。
-
-Windows 上**硬链接不需要管理员权限**（软链接需要开发者模式），且不占额外空间 ——
-`dataset/` 里的图片与 `output/images/` 里的是同一个文件。代价是修改任一边都会影响另一边，
-需要独立副本请用 `--link-mode copy`。重复运行会识别已存在的链接并跳过，不会重复占空间。
-
 ---
 
 ## 第三步：组装成 LeRobot v3.0 数据集
@@ -296,11 +355,16 @@ python export_lerobot.py --input dataset --output lerobot_dataset
 | `--input` / `-i` | `dataset` | 第二步的产物目录 |
 | `--output` / `-o` | `lerobot_dataset` | 数据集输出目录 |
 | `--repo-id` | `local/embodied-videos` | 数据集标识（lerobot 必填，本质是 HF Hub 路径格式） |
-| `--camera` | `front` | 相机名，生成 `observation.images.<camera>` |
+| `--camera` | 全部相机 | 只导出指定相机（仅单相机清单可用） |
 | `--fps` | 取 `info.json` 的值 | 处理帧率 |
 | `--task` | 空串 | 每帧任务标注；无标注则留空 |
 | `--vcodec` | `h264` | 视频编码器，见下 |
+| `--images-root` | 取 `info.json` 的 `extras.image_root` | 第一步图片目录；移动过目录或只保留清单时显式指定 |
 | `--force` | 关 | 输出目录已存在时**整目录删掉重建** |
+| `--dataset-id` / `--dataset-version` | 见下 | 数据集逻辑 ID / 物理版本；写入 manifest |
+| `--robot-type` / `--action-space-id` / `--state-space-id` / `--control-mode` | `unknown` | 训练侧语义字段 |
+| `--stats-path` / `--split-path` / `--split-rules` / `--recommended-split` | 见下 | 统计与 split 契约 |
+| `--suggested-sampling-weight` | `1.0` | 跨数据集采样权重建议 |
 
 `meta/` 下的 parquet 与 `info.json` 全部由 lerobot 自己生成，脚本只负责喂数据。这样格式
 正确性由官方代码保证；lerobot 升级格式时跟着升级 API 即可，无需重新逆向。
@@ -317,19 +381,16 @@ python export_lerobot.py --input dataset --output lerobot_dataset
 批次超过约 2 GB 会因 int32 偏移溢出而失败；写一个 episode 时，全部帧要同时驻留内存
 （1080p × 1000 帧 ≈ 6.2 GB）。视频模式两者都没有，代价是**有损编码**，解码也比读图片慢。
 
-**实测体积**（2674 帧 1080p 示例素材）：视频模式 **220 MB**；同样内容用图片模式会写到
-5 GB 以上，并因第 1 条限制失败。约 24 倍。
-
 ### `--vcodec` 怎么选
 
-| 编码器 | 编码速度（1080p 实测） | 解码代价 | 备注 |
+| 编码器 | 速度 | 解码代价 | 备注 |
 |---|---|---|---|
-| `h264`（默认） | ~8.5 fps | 约为读图片的 **2.2 倍** | 各种尺寸都能用（宽高须为偶数，见下方说明） |
-| `libsvtav1` | ~17.9 fps | 约为读图片的 **5 倍** | **16×32 这种小图会让进程直接崩** |
+| `h264`（默认） | 中等 | 较低 | 各种尺寸都能用（宽高须为偶数，见下方说明） |
+| `libsvtav1` | 较慢 | 较高 | **极小尺寸的帧会让进程直接崩** |
 | `auto` | 最快（走硬件编码器） | 视硬件而定 | 硬件编码器有最小尺寸要求，小图会失败 |
 
-编码速度是 1080p、`g=2`、`crf=30` 下的实测值；默认选 `h264`，因为尺寸鲁棒、解码最快、
-软件编码到处可用。素材都是大尺寸且机器有硬件编码器时，`--vcodec auto` 能明显加快写入。
+默认选 `h264`，因为尺寸鲁棒、解码最快、软件编码到处可用。素材都是大尺寸且机器有硬件
+编码器时，`--vcodec auto` 能明显加快写入。
 
 > 编码器使用 `yuv420p`，要求宽高都是偶数。普通摄像头 / h264 素材不会踩到；ProRes、
 > RGB、4:4:4 等非 4:2:0 素材若带奇数尺寸，先在输入侧补齐：
@@ -351,21 +412,27 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 ds = LeRobotDataset("local/embodied-videos", root="lerobot_dataset")
 frame = ds[0]
-frame["observation.images.front"]    # (3, H, W) float32，取值 [0, 1]，按需从视频解码
+frame["observation.images.cam_1"]    # (3, H, W) float32，取值 [0, 1]，按需从视频解码
+frame["observation.images.cam_2"]    # 每路相机一个特征，shape 可以不同
 frame["timestamp"]                   # 相对本 episode 起点的时间戳，见下
 frame["source_frame"]                # 原始视频里的帧号（跨 episode 唯一）
-frame["blur_score"]                  # Laplacian 方差；下游按它自行过滤模糊帧
+frame["blur_score"]                  # (C,) Laplacian 方差；顺序与相机顺序一致
 frame["action"]                      # (A,) 动作；只有接了动作数据才有（见「接动作数据」）
 frame["observation.state"]           # (A,) 状态；同上
 ```
+
+`blur_score` 是一列向量：第 i 维对应 `info.json` 中第 i 个 `observation.images.*` 特征，
+特征本身也带 `names = [相机名...]`。单相机数据集仍是 `(1,)`，与旧行为一致。
 
 ### 数据集结构
 
 ```
 lerobot_dataset/
+├── dataset_manifest.json                   # 本管线写的权威自描述（不属于 lerobot 格式）
 ├── data/chunk-000/file-000.parquet         # 数值列（timestamp/source_frame/blur_score…）
-├── videos/observation.images.front/
-│   └── chunk-000/file-000.mp4              # 帧编码成的视频，按大小轮转；一个文件可含多个 episode
+├── videos/
+│   ├── observation.images.cam_1/chunk-000/file-000.mp4
+│   └── observation.images.cam_2/chunk-000/file-000.mp4
 └── meta/
     ├── info.json                           # features 定义，codebase_version = v3.0
     ├── stats.json                          # 各特征的统计量
@@ -373,8 +440,49 @@ lerobot_dataset/
     └── episodes/chunk-000/file-000.parquet # 每集在 parquet 与 mp4 里的起止位置
 ```
 
+每个相机一路视频流，帧按大小轮转；一个文件可含多个 episode。`dataset_manifest.json`
+不修改 lerobot 生成的 `meta/info.json`，避免未知字段告警。
+
 视频文件按 `video_files_size_in_mb`（lerobot 默认 200 MB）轮转，一个文件可容纳多个
 episode；parquet 同理按 `data_files_size_in_mb`（默认 100 MB）轮转。
+
+### 数据集 manifest 与索引
+
+`lerobot_dataset/dataset_manifest.json` 是**唯一权威自描述**。关键字段：
+
+| 字段 | 含义 |
+|---|---|
+| `schema_version` | manifest 结构版本 |
+| `dataset_id` | 稳定逻辑 ID；`--dataset-id`，缺省用 `repo_id`，与路径无关 |
+| `dataset_version` / `content_hash` | 物理版本；缺省取 `content_hash` 前 12 位 |
+| `manifest_status` | `complete` / `partial`；语义字段未知时是 `partial` |
+| `num_episodes` / `num_samples` / `num_camera_frames` | episode 数、同步采样数、每路相机帧数 |
+| `cameras` | 相机名、shape、原始 fps，顺序与 `blur_score` 向量一致 |
+| `action_dim` / `state_dim` | 动作/状态维度；无动作时为 `null` |
+| `action_space_id` / `state_space_id` / `control_mode` / `units` / `joint_order` | 动作语义；不知道就保持 `unknown` / `null` |
+| `stats_path` / `stats_status` / `stats_split` | 统计量位置与状态 |
+| `split_path` / `split_rules` / `recommended_split` | split 优先级：显式文件 > 规则 > 建议 |
+| `suggested_sampling_weight` | 跨数据集采样权重建议，训练配置必须能覆盖 |
+| `source` | 原始根目录、分组方式、相机名映射；不参与 ID |
+
+`content_hash = sha256(manifest 字段 + meta/info.json + 相对文件索引)`，**不哈希像素**。
+同一份素材重跑应得到相同版本；只改像素而文件路径/大小不变时 hash 可能不变，这是当前
+记录下来的已知限制。
+
+`build_dataset_index.py` 扫描一个根目录下的所有 manifest，生成可重建的 `datasets.json`：
+
+```bash
+python build_dataset_index.py --root D:/datasets --output D:/datasets/datasets.json
+```
+
+索引只是缓存：删掉可随时重建。冲突规则是硬错误 —— 同一 `(dataset_id, dataset_version)`
+出现在两个路径、同一路径出现多条记录、manifest 读取失败，都会中止而不是静默跳过。
+`--infer-legacy` 可以把没有 manifest 的旧数据集按 `partial` 临时登记。
+
+**训练侧最小契约**：按 `dataset_manifest.json` 发现和采样数据集；按 source 应用各自的
+transform、统计量和动作映射；`manifest_status=partial` 的数据集不要直接用于跨机器人
+动作映射，除非训练配置显式忽略语义字段。每个数据集内部是同构的，跨数据集混合不需要
+黑图补齐；如果将来要合并成单一数据集，再引入每帧 `source_id` / `camera_mask`。
 
 ### 时间轴：由构造保证均匀
 
@@ -388,8 +496,8 @@ lerobot 的 `add_frame()` 把 timestamp 硬编码为 `frame_index / fps`，且�
 | 列 | 含义 |
 |---|---|
 | `timestamp` | `frame_index / fps`，即相对本 episode 起点的秒数 |
-| `source_frame` | 原始视频里的帧号；**在同一个源视频内跨 episode 唯一**（切分不会让它重置），但不同视频的帧号会重叠 —— 定位一帧要 `source_video` + `source_frame` |
-| `blur_score` | 该帧的 Laplacian 方差，**下游按它自行过滤** |
+| `source_frame` | 原始视频里的帧号；同一集内各路相机共享，**在同一个源视频内跨 episode 唯一**（切分不会让它重置），但不同视频的帧号会重叠 —— 绝对来源要结合 episode/`source_videos` |
+| `blur_score` | 该帧各相机的 Laplacian 方差，长度 C，顺序与相机特征一致；**下游按它自行过滤** |
 
 要还原绝对时间：第二步产物 `dataset/meta/episodes.jsonl` 里每集都有
 `first_source_frame`，除以该集的 `source_fps` 再加上 `timestamp` 即可（`source_fps`
@@ -429,14 +537,16 @@ lerobot 把 `delta_timestamps` 的秒数按 `round(d * fps)` 换算成帧索引�
 
 ```python
 ds = LeRobotDataset("local/embodied-videos", root="lerobot_dataset")
-keep = ds.hf_dataset.filter(lambda row: row["blur_score"] >= 100)
+# blur_score 是 (C,)；这里的策略是「所有相机都清晰才保留」，按需改成 any / 指定相机
+keep = ds.hf_dataset.filter(
+    lambda row: all(score >= 100 for score in row["blur_score"])
+)
 ```
 
 ### `--force` 是整目录重建
 
 lerobot 的 `create()` 要求输出目录**不存在**，因此 `--force` 的语义是「删掉整个目录重新
-生成」，而非「往上覆盖」。重建结果必然是干净的，不存在上一轮的残留文件。（第二步的
-`--force` 行为不同，会保留旧文件，见「已知限制」。）
+生成」，而非「往上覆盖」。重建结果必然是干净的，不存在上一轮的残留文件。
 
 **编码参数。** 脚本只传 `vcodec`，其余用 lerobot 默认值：`g=2`（每 2 帧一个关键帧）、
 `crf=30`。短 GOP 是为随机访问优化的，压缩率会低一些。要调就改 `write_dataset()` 里的
@@ -464,11 +574,13 @@ pip install --force-reinstall --no-deps opencv-python
 ## 接动作数据（可选）
 
 ```bash
-python import_actions.py --format droid --input videos --dataset dataset
+python import_actions.py --format droid --group-by file --input videos --dataset dataset
+python import_actions.py --format droid --group-by dir  --input videos --dataset dataset
 ```
 
 排位在**第二步之后、第三步之前**（不在三步管线里，但第三步依赖它的产物）。它回答一个问题：
-这份数据集能不能训练策略。只有 observation 的话只能训世界模型、视频预测那一类（见「已知限制 1」）。
+这份数据集能不能训练策略。只有 observation 的话只能训世界模型、视频预测那一类（见「已知限制」）。
+`--group-by` 必须与第一步一致；不一致会直接报错，避免动作静默配错。
 
 ### 为什么单开一个脚本
 
@@ -476,7 +588,7 @@ python import_actions.py --format droid --input videos --dataset dataset
 数据源的「方言」——管线不该认识它们。所以先用一个适配器把方言翻成统一格式：
 
 ```
-<素材目录> ──import_actions.py──▶ dataset/meta/actions/<源视频>.npz
+<素材目录> ──import_actions.py──▶ dataset/meta/actions/<episode>.npz
    （各方言）                            action (N, A) / state (N, A)
 ```
 
@@ -485,8 +597,8 @@ python import_actions.py --format droid --input videos --dataset dataset
 
 ### 侧车格式
 
-每个源视频一个 `.npz`，文件名就是帧清单里的 `source_video`（即第一步算出的文件名前缀）。
-里面两列：
+每个 episode 一个 `.npz`，文件名就是帧清单里的 `episode`（旧清单没有该字段时才回退
+`source_video`）。dir 模式下同集的多路相机共用这一份动作，不会按相机复制。里面两列：
 
 | 数组 | 含义 |
 |---|---|
@@ -505,17 +617,17 @@ python import_actions.py --format droid --input videos --dataset dataset
 | `action` | `action/joint_position` (7) ⊕ `action/gripper_position` (1) |
 | `observation.state` | `action/robot_state/joint_positions` (7) ⊕ `action/robot_state/gripper_position` (1) |
 
-**两者不能混用**：`action/` 是下发的指令，`action/robot_state/` 是实际状态，实测两者平均差
-约 1.5°（跟踪误差）。用错了不会报错，只会让模型学到「命令和结果是一回事」。
+**两者不能混用**：`action/` 是下发的指令，`action/robot_state/` 是实际状态。用错了不会
+报错，只会让模型学到「命令和结果是一回事」。
 
 ### 动作必须齐备
 
-一旦侧车里有了某个源视频，第三步就要求**它的每一帧都能取到动作**——缺了在落盘前报错，
+一旦侧车里有了某个 episode，第三步就要求**它的每一帧都能取到动作**——缺了在落盘前报错，
 不填默认值。理由和 `blur_score` 一样：静默填 0 等于告诉模型「此刻机器人什么也没做」，而且
 不会报错。
 
-只给一部分源视频动作是不行的（lerobot 要求声明的特征每帧都有）。要么补齐，要么把那些素材
-从 `videos/` 里排除。
+只给一部分 episode 动作是不行的（lerobot 要求声明的特征每帧都有）。要么补齐，要么把那些
+素材从 `videos/` 里排除。
 
 ---
 
@@ -569,8 +681,8 @@ Laplacian 方差分布通常不是双峰的，所以工具不自动推荐阈值�
 ## 测试
 
 ```bash
-pytest            # 226 个用例，约 5 秒
-pytest -m slow    # 8 个用例，含真实调用 lerobot，约 10 秒
+pytest            # 319 个用例，约 5 秒
+pytest -m slow    # 9 个用例，含真实调用 lerobot，约 10 秒
 ```
 
 第三步的测试分两层：不碰 lerobot 的纯逻辑（读清单、组装特征、校验帧文件）在默认套件中，
@@ -578,18 +690,17 @@ pytest -m slow    # 8 个用例，含真实调用 lerobot，约 10 秒
 调用 —— 漏掉它 parquet 不会写 footer，文件看似存在但无法加载。
 
 **默认测试**不依赖 `videos/` 和 `output/`（两者都在 `.gitignore` 中），换台机器克隆后
-可直接运行；`-m slow` 的用例依赖真实素材，缺失时会自动跳过。测试图片是三个不到 1KB
-的真实 JPEG，见 `tests/fixtures/README.md`。
+可直接运行。`-m slow` 中真正读仓库真实素材的用例在目录缺失时会自动跳过，其余用测试夹具
+合成数据。测试图片是三个不到 1KB 的真实 JPEG，见 `tests/fixtures/README.md`。
 
-`clean_video.py` / `format_dataset.py` 的 `main()` 多进程端到端刻意未测 —— 运行慢、
-依赖进程调度、容易假失败，而其中逻辑已被 `process_video`、`write_images_meta` 和
-`write_blur_scores` 分别覆盖。
+第一步的 dir 模式有一个用合成 mp4 的端到端用例（覆盖 `main()` 的多进程路径）；其余
+`main()` 逻辑仍由 `process_video`、`write_images_meta`、`write_blur_scores` 分别覆盖。
 
 ---
 
 ## 已知限制
 
-### 1. 动作数据得自己提供
+### 动作数据得自己提供
 
 LeRobot 是**模仿学习**数据集，核心是 `(observation, action)` 配对。本项目**采集**的只有
 observation —— 动作推不出来，必须有另外的来源（机器人日志、遥操作记录等）。
@@ -601,18 +712,5 @@ observation —— 动作推不出来，必须有另外的来源（机器人日�
 - **没有** → 只有 observation，能训感知预训练、世界模型、视频预测那一类，训不了策略。
 
 `import_actions.py` 目前只带一个 DROID 适配器。换数据源要自己加一个 `find_*_sources`
-（从素材目录找到动作文件）和一个 `load_*`（读出来并并成 `(N, 8)`）——转换本身是格式适配，
-不涉及管线逻辑。
-
-### 2. 重跑 `--force` 不会清理多余的旧文件
-
-第二步的 `--force` 会保留旧文件：若改了 `--max-episode-seconds` 导致 episode 数变少，
-上次运行生成的 `episode_XXXXXX` 目录会残留在原处；帧数变多时也可能留下位置错位的旧文件
-（帧文件名按 episode 内位置编号）。**改了切分长度就先把 `dataset/` 整个删掉再跑。**
-
-第三步的 `--force` 不同，它是整目录 `rmtree` 重建，不会留残渣。
-
-### 3. 只支持单相机
-
-一个 mp4 对应一个 episode。同一集的多路视角（如 DROID 的外部 + 腕部相机）会被拆成多个
-独立 episode，语义上是错的。当前管线尚未实现多相机支持。
+（从素材目录找到动作文件）和一个 `load_*`（读出来并拼成 `(N, A)`）。Dir 模式下适配器
+需要按 episode 目录返回**一个**动作源；转换本身是格式适配，不涉及管线逻辑。

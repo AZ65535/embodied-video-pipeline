@@ -8,3 +8,5 @@ output/
 dataset/
 videos/
 lerobot_dataset/
+# build_dataset_index.py 的可重建缓存（含本机绝对路径，不应进仓库）
+datasets.json

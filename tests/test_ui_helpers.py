@@ -50,7 +50,6 @@ def test_config_from_form_maps_checkboxes_and_mode():
         5,
         100,
         60,
-        "auto",
         "front",
         "task",
         "h264",
@@ -66,7 +65,7 @@ def test_config_from_form_maps_checkboxes_and_mode():
 def test_config_from_form_maps_invalid_numbers_to_validation_errors():
     config = h.config_from_form(
         "in", "out", "ds", "ld", True, True, True,
-        None, "bad", None, "auto", "front", "", "h264", "local/x", "normal",
+        None, "bad", None, "front", "", "h264", "local/x", "normal",
     )
     assert config.fps == 0
     assert config.blur_threshold == 0.0
@@ -178,7 +177,7 @@ def build_dataset(tmp_path, malformed_frame=False):
         },
         "extras": {
             "blur_score_threshold": 100,
-            "link_mode": "hardlink",
+            "image_root": "../out/images",
             "camera_key": "observation.images.front",
         },
     }
@@ -239,7 +238,7 @@ def test_summary_reads_info_episodes_and_frames(tmp_path):
     assert summary.blur_threshold == 100
     assert summary.camera_key == "observation.images.front"
     assert summary.shape == (48, 64)
-    assert summary.link_mode == "hardlink"
+    assert summary.image_root == "../out/images"
     assert dict(summary.episode_counts) == {"1": 1, "2": 1}
     assert dict(summary.episode_frames) == {"1": 3, "2": 2}
     assert dict(summary.fps_origins) == {"_meta.json": 2}
@@ -247,7 +246,6 @@ def test_summary_reads_info_episodes_and_frames(tmp_path):
     assert summary.blurry_frames == 1
     assert summary.missing_score_frames == 1
     assert [artifact.done for artifact in summary.artifacts] == [False, True, False]
-    assert "hardlink 模式" in "\n".join(summary.warnings)
     assert "数据集摘要" in h.render_summary(summary)
 
 
@@ -428,7 +426,7 @@ def test_config_for_format_rerun_derives_params_from_info(tmp_path):
     assert config.mode == "force"
     assert config.fps == 5
     assert config.camera == "front"
-    assert config.link_mode == "hardlink"
+    assert config.max_episode_seconds == 60.0
 
 
 def test_config_for_format_rerun_falls_back_without_info(tmp_path):
@@ -605,3 +603,109 @@ def test_ui_helpers_does_not_import_cv2_or_gradio():
         encoding="utf-8",
     )
     assert output.strip() == "False False"
+
+
+# ---------------------------------------------------------------------------
+# 多相机
+# ---------------------------------------------------------------------------
+
+
+def test_config_from_form_maps_multi_camera_fields():
+    config = h.config_from_form(
+        "in", "out", "ds", "ld", True, True, True, 5, 100, 60,
+        "", "", "h264", "local/x", "normal",
+        "dir", "names.json", "droid_autolab", "droid",
+    )
+    assert config.group_by == "dir"
+    assert config.camera_names == "names.json"
+    assert config.dataset_id == "droid_autolab"
+    assert config.robot_type == "droid"
+
+
+def test_dir_mode_plan_does_not_require_camera(tmp_path):
+    (tmp_path / "videos").mkdir()
+    config = make_config(
+        tmp_path,
+        selected_steps=(1,),
+        group_by="dir",
+        camera="",
+    )
+    plan = h.build_plan(config)
+    assert not [error for error in plan.errors if "相机名" in error]
+    cmd = plan.to_run[0].cmd
+    assert cmd[cmd.index("--group-by") + 1] == "dir"
+    assert "--camera" not in cmd
+
+
+def test_dir_mode_with_camera_names_validates_file_exists(tmp_path):
+    (tmp_path / "videos").mkdir()
+    config = make_config(
+        tmp_path,
+        selected_steps=(1,),
+        group_by="dir",
+        camera="front",
+        camera_names=str(tmp_path / "missing.json"),
+    )
+    plan = h.build_plan(config)
+    assert any("相机名映射文件不存在" in error for error in plan.errors)
+
+
+def test_summary_lists_all_cameras_without_false_frame_count_warning(tmp_path):
+    dataset = tmp_path / "ds"
+    meta = dataset / "meta"
+    meta.mkdir(parents=True)
+    info = {
+        "total_episodes": 1,
+        "total_frames": 5,
+        "fps": 5,
+        "features": {
+            "observation.images.a": {"shape": [48, 64, 3]},
+            "observation.images.b": {"shape": [24, 32, 3]},
+        },
+        "extras": {
+            "group_by": "dir",
+            "cameras": ["a", "b"],
+            "total_camera_rows": 10,
+        },
+    }
+    (meta / "info.json").write_text(json.dumps(info), encoding="utf-8")
+    (meta / "episodes.jsonl").write_text(
+        json.dumps(
+            {
+                "episode_index": 0,
+                "episode": "ep1",
+                "source_video": "a",
+                "length": 5,
+                "source_fps_origin": "_meta.json",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (meta / "frames.jsonl").write_text(
+        "\n".join(
+            json.dumps({"is_blurry": False, "blur_score": 200.0})
+            for _ in range(10)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    paths = h.ResolvedPaths(
+        input_dir=tmp_path / "videos",
+        output_base=tmp_path / "out",
+        images_dir=tmp_path / "out" / "images",
+        dataset_dir=dataset,
+        lerobot_dir=tmp_path / "ld",
+    )
+    summary = h.summarize_paths(paths, [])
+
+    assert summary.cameras == [("a", (48, 64)), ("b", (24, 32))]
+    assert summary.camera_key == "observation.images.a"
+    assert dict(summary.episode_counts) == {"ep1": 1}
+    assert not [
+        warning for warning in summary.warnings if "相机帧行" in warning
+    ]
+    rendered = h.render_summary(summary)
+    assert "2 路" in rendered
+    assert "observation.images.a" in rendered
+    assert "observation.images.b" in rendered

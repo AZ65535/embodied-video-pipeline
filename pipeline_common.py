@@ -11,6 +11,7 @@
 一旦引入重依赖，第二步和辅助工具的「纯标准库」性质就没了。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -31,6 +32,13 @@ FRAMES_JSONL = "frames.jsonl"
 EPISODES_JSONL = "episodes.jsonl"
 TASKS_JSONL = "tasks.jsonl"
 INFO_JSON = "info.json"
+
+# ---- 数据集自描述与索引 ----
+MANIFEST_FILENAME = "dataset_manifest.json"
+INDEX_FILENAME = "datasets.json"
+PIPELINE_VERSION = "0.1.0"
+DATASET_MANIFEST_SCHEMA_VERSION = 1
+INDEX_SCHEMA_VERSION = 1
 
 # ---- 动作侧车（import_actions.py 写、export_lerobot.py 读）----
 ACTIONS_DIRNAME = "actions"
@@ -69,12 +77,13 @@ STANDALONE_MARKERS = frozenset(
 
 
 class FrameRow(TypedDict):
-    """format_dataset.py 写进 meta/frames.jsonl 的一行（一行一帧）。"""
+    """format_dataset.py 写进 meta/frames.jsonl 的一行（一行一个相机帧）。"""
 
     index: int
     episode_index: int
     frame_index: int
     source_frame: int
+    camera: str
     blur_score: Optional[float]
     is_blurry: Optional[bool]
     timestamp: float
@@ -87,11 +96,15 @@ class EpisodeRow(TypedDict):
     episode_index: int
     tasks: List[str]
     length: int
+    episode: str
     source_video: str
-    frame_dir: str
+    cameras: List[str]
+    source_videos: Dict[str, str]
     fps: int
     source_fps: Optional[float]
     source_fps_origin: Optional[str]
+    source_fps_by_camera: Dict[str, Optional[float]]
+    source_fps_origin_by_camera: Dict[str, Optional[str]]
     first_source_frame: int
     last_source_frame: int
     segment_index: int
@@ -290,3 +303,80 @@ def atomic_write_json(
         logger.exception("写入 %s 失败", path)
         return False
     return True
+
+
+# ---- 多相机契约 ----
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *{f"COM{i}" for i in range(1, 10)},
+    *{f"LPT{i}" for i in range(1, 10)},
+}
+_INVALID_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+
+
+def camera_key(name: str) -> str:
+    return f"observation.images.{name}"
+
+
+def validate_camera_name(name: str) -> Optional[str]:
+    """返回 None 表示合法，否则返回原因。"""
+    if not name:
+        return "相机名不能为空"
+    if name in {".", ".."}:
+        return "相机名不能是 '.' 或 '..'"
+    if len(name) > 64:
+        return "相机名最长 64 个字符"
+    if _INVALID_NAME_CHARS.search(name):
+        return "相机名包含路径分隔符或 Windows 非法字符"
+    if name[-1] in " .":
+        return "相机名不能以空格或点结尾"
+    if name.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        return "相机名是 Windows 保留设备名"
+    return None
+
+
+def canonical_camera_order(names: Iterable[str]) -> List[str]:
+    """相机规范顺序：大小写不敏感的自然排序。"""
+    return sorted(names, key=lambda name: natural_key(name.casefold()))
+
+
+def load_camera_names(path: Optional[Path]) -> Dict[str, str]:
+    """读取 --camera-names 映射（filename stem -> camera name）。"""
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取相机名映射 {path}：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"相机名映射 {path} 必须是 JSON 对象")
+    result: Dict[str, str] = {}
+    for stem, name in payload.items():
+        if not isinstance(stem, str) or not isinstance(name, str):
+            raise ValueError(f"相机名映射 {path} 的键和值都必须是字符串")
+        reason = validate_camera_name(name)
+        if reason:
+            raise ValueError(f"相机名映射 {path} 中 {stem!r} -> {name!r}：{reason}")
+        result[stem] = name
+    return result
+
+
+def episode_key_for_dir(relative_dir: Path) -> str:
+    """把相对 episode 目录转成文件系统安全的 episode key。
+
+    根目录（`.`）使用 `_root`；路径分隔符换成 `_`；非法字符替换为 `_`；
+    保留设备名加前缀；超长时截断并附加 sha1 前缀。
+    """
+    raw = "_".join(relative_dir.parts) if relative_dir.parts else "_root"
+    if raw in {"", ".", "..", "_root"}:
+        raw = "_root" if raw in {"", ".", ".."} else raw
+    sanitized = _INVALID_NAME_CHARS.sub("_", raw).rstrip(" .")
+    if not sanitized:
+        sanitized = "_root"
+    if sanitized.split(".")[0].upper() in _WINDOWS_RESERVED_NAMES:
+        sanitized = "_" + sanitized
+    if len(sanitized) > 120:
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+        sanitized = sanitized[:100] + "_" + digest
+    return sanitized

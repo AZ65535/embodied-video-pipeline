@@ -6,16 +6,20 @@
     dataset/ ──export_lerobot.py──▶ lerobot_dataset/
 
 meta/ 下的 parquet 和 info.json 全部由 lerobot 自己生成，格式正确性由官方代码保证。
-与上游的差异、以及本脚本做不到的事情，见 README 的「第三步」。
+导出结束后额外写 `dataset_manifest.json`（本管线自己的权威自描述）。与上游的差异、
+以及本脚本做不到的事情，见 README 的「第三步」。
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import shutil
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -28,28 +32,54 @@ from pipeline_common import (
     ACTION_ARRAY,
     ACTION_KEY,
     BLUR_SCORE_KEY,
+    DATASET_MANIFEST_SCHEMA_VERSION,
     DEFAULT_CAMERA,
     DEFAULT_REPO_ID,
     EPISODES_JSONL,
     FRAMES_JSONL,
     INFO_JSON,
+    MANIFEST_FILENAME,
     META_DIRNAME,
+    PIPELINE_VERSION,
     SOURCE_FRAME_KEY,
     STATE_ARRAY,
     STATE_KEY,
+    atomic_write_json,
+    canonical_camera_order,
     probe_jpeg,
     read_jsonl,
     setup_logging,
 )
 
+@dataclass(frozen=True)
+class CameraSpec:
+    """一路相机的特征名与声明尺寸。"""
+
+    name: str
+    key: str
+    height: int
+    width: int
+
+
 @dataclass
 class EpisodeFrames:
-    """一个 episode 及其帧清单（尚未落盘）。"""
+    """一个 episode 及其每一路相机的帧清单（尚未落盘）。"""
 
     episode_index: int
-    source_video: str
+    episode: str
+    source_video: Optional[str]
+    cameras: List[str]
     source_fps: Optional[float]
-    frames: List[dict]
+    frames_by_camera: Dict[str, List[dict]]
+    length: int = 0
+    has_episode_key: bool = True
+    declared_cameras: Optional[List[str]] = None
+    declared_length: Optional[int] = None
+
+    @property
+    def frames(self) -> List[dict]:
+        """主相机帧，供兼容/报告使用。"""
+        return self.frames_by_camera[self.cameras[0]]
 
 
 def load_info(dataset_dir: Path) -> dict:
@@ -66,10 +96,7 @@ def load_info(dataset_dir: Path) -> dict:
 
 
 def resolve_camera_shape(info: dict, camera_key: str) -> Tuple[int, int]:
-    """从 info.json 取该相机的 (height, width)。
-
-    沿用 format_dataset.py 的众数决定 —— lerobot 要求每帧尺寸都与声明一致。
-    """
+    """兼容包装：从 info.json 取单个相机的 (height, width)。"""
     features = info.get("features")
     if not isinstance(features, dict) or camera_key not in features:
         raise ValueError(
@@ -85,52 +112,153 @@ def resolve_camera_shape(info: dict, camera_key: str) -> Tuple[int, int]:
     return height, width
 
 
+def resolve_cameras(info: dict, override: Optional[str] = None) -> List[CameraSpec]:
+    """从 info.json 解析所有相机；--camera 仅允许单相机覆盖。"""
+    features = info.get("features")
+    if not isinstance(features, dict):
+        raise ValueError("info.json 缺少 features")
+    keys = [
+        key
+        for key in features
+        if isinstance(key, str) and key.startswith("observation.images.")
+    ]
+    if not keys:
+        raise ValueError("info.json 里没有任何 observation.images.* 特征")
+
+    if override:
+        key = f"observation.images.{override}"
+        if key not in keys:
+            raise ValueError(
+                f"info.json 里没有相机特征 {key}；现有相机：{sorted(keys)}"
+            )
+        if len(keys) > 1:
+            raise ValueError(
+                "info.json 声明了多个相机，不能再传 --camera；"
+                "相机名来自清单的 extras.cameras"
+            )
+        selected = [key]
+    else:
+        extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
+        declared = extras.get("cameras")
+        if isinstance(declared, list) and declared:
+            selected = [f"observation.images.{name}" for name in declared]
+            missing = [key for key in selected if key not in keys]
+            if missing:
+                raise ValueError(f"extras.cameras 中的特征不存在：{missing}")
+        else:
+            selected = [
+                f"observation.images.{name}"
+                for name in canonical_camera_order(
+                    key[len("observation.images.") :] for key in keys
+                )
+            ]
+
+    cameras = []
+    for key in selected:
+        height, width = resolve_camera_shape(info, key)
+        cameras.append(
+            CameraSpec(
+                name=key[len("observation.images.") :],
+                key=key,
+                height=height,
+                width=width,
+            )
+        )
+    return cameras
+
+
 def build_features(
-    camera_key: str, height: int, width: int, action_dim: Optional[int] = None
+    cameras_or_key,
+    height: Optional[int] = None,
+    width: Optional[int] = None,
+    action_dim: Optional[int] = None,
 ) -> dict:
     """组装 lerobot 的 features 描述。
 
-    这里是唯一描述数据集有哪些特征的地方。
-
-    相机标 "video" 而不是 "image"：前者把帧编码成 mp4，后者把图片字节直接嵌进
-    parquet。图片模式有两个在大数据量下会爆的限制 —— 单个 arrow 批次超过 2 GB
-    （32 位偏移）会报错，以及一个 episode 的全部帧要同时驻留内存。视频模式两个
-    都没有，代价是有损编码。
-
-    action_dim 非空时加上 action / observation.state 两列 —— 有了它们，
-    数据集才谈得上训练策略（只有 observation 的话只能训世界模型那一类）。
+    兼容旧调用：传单个 camera_key + height/width；新代码传 CameraSpec 列表。
     """
-    features = {
-        camera_key: {
+    if isinstance(cameras_or_key, str):
+        key = cameras_or_key
+        if height is None or width is None:
+            raise ValueError("单个 camera_key 调用必须传 height 和 width")
+        cameras = [
+            CameraSpec(
+                name=key[len("observation.images.") :]
+                if key.startswith("observation.images.")
+                else key,
+                key=key,
+                height=height,
+                width=width,
+            )
+        ]
+    else:
+        cameras = list(cameras_or_key)
+
+    features = {}
+    for camera in cameras:
+        features[camera.key] = {
             "dtype": "video",
-            "shape": (height, width, 3),
+            "shape": (camera.height, camera.width, 3),
             "names": ["height", "width", "channels"],
-        },
-        SOURCE_FRAME_KEY: {"dtype": "int64", "shape": (1,), "names": None},
-        BLUR_SCORE_KEY: {"dtype": "float32", "shape": (1,), "names": None},
+        }
+    features[SOURCE_FRAME_KEY] = {"dtype": "int64", "shape": (1,), "names": None}
+    features[BLUR_SCORE_KEY] = {
+        "dtype": "float32",
+        "shape": (len(cameras),),
+        "names": [camera.name for camera in cameras] if len(cameras) > 1 else None,
     }
     if action_dim is not None:
         # 与官方 lerobot/droid_1.0.1 的口径一致：8 维 = 7 关节 + 1 夹爪。
-        # names 留 None：侧车是数据源无关的，管线不该假定轴的语义。
         features[ACTION_KEY] = {"dtype": "float32", "shape": (action_dim,), "names": None}
         features[STATE_KEY] = {"dtype": "float32", "shape": (action_dim,), "names": None}
     return features
 
 
 def group_episodes(
-    frames: Sequence[dict], episodes: Sequence[dict]
+    frames: Sequence[dict],
+    episodes: Sequence[dict],
+    camera_names: Optional[Sequence[str]] = None,
 ) -> List[EpisodeFrames]:
-    """按 episode_index 把帧清单分组，并挂上 episode 级信息。"""
+    """按 episode_index 把帧清单分组，并挂上 episode 级信息。
+
+    一行帧清单对应一个 (相机, 帧位置)。同一 episode 的各路相机必须逐位置对齐：
+    frame_index / source_frame / timestamp 序列完全一致。旧清单没有 ``camera``
+    字段时按单相机处理（默认 front）。
+    """
+    fallback_camera = (
+        camera_names[0] if camera_names and len(camera_names) == 1 else DEFAULT_CAMERA
+    )
+
     by_episode: Dict[int, EpisodeFrames] = {}
     for row in episodes:
         index = row.get("episode_index")
-        if not isinstance(index, int):
+        if isinstance(index, bool) or not isinstance(index, int):
             raise ValueError(f"episodes.jsonl 里有非法 episode_index：{row!r}")
+        source_video = row.get("source_video")
+        episode_key = row.get("episode")
+        has_episode_key = isinstance(episode_key, str) and bool(episode_key)
+        if not has_episode_key:
+            episode_key = str(source_video if source_video is not None else index)
+        declared = row.get("cameras")
+        if declared is not None and (
+            not isinstance(declared, list)
+            or not declared
+            or not all(isinstance(name, str) and name for name in declared)
+        ):
+            raise ValueError(
+                f"episodes.jsonl 里 episode {index} 的 cameras 不合法：{declared!r}"
+            )
         by_episode[index] = EpisodeFrames(
             episode_index=index,
-            source_video=str(row.get("source_video", index)),
+            episode=str(episode_key),
+            source_video=None if source_video is None else str(source_video),
+            cameras=[],
             source_fps=row.get("source_fps"),
-            frames=[],
+            frames_by_camera={},
+            length=0,
+            has_episode_key=has_episode_key,
+            declared_cameras=list(declared) if declared else None,
+            declared_length=row.get("length"),
         )
 
     for row in frames:
@@ -139,26 +267,108 @@ def group_episodes(
             raise ValueError(
                 f"frames.jsonl 里的 episode_index {index!r} 在 episodes.jsonl 中不存在"
             )
-        by_episode[index].frames.append(row)
+        camera = row.get("camera")
+        if camera is None:
+            camera = fallback_camera
+        elif not isinstance(camera, str) or not camera:
+            raise ValueError(f"frames.jsonl 里非法 camera 字段：{row!r}")
+        by_episode[index].frames_by_camera.setdefault(camera, []).append(row)
 
     ordered = [by_episode[key] for key in sorted(by_episode)]
     for episode in ordered:
-        if not episode.frames:
+        if not episode.frames_by_camera:
             raise ValueError(f"episode {episode.episode_index} 一帧都没有")
-        # 帧必须按 episode 内位置有序，否则写进去的顺序会错乱
-        episode.frames.sort(key=lambda row: row.get("frame_index", 0))
+
+        actual = set(episode.frames_by_camera)
+        if episode.declared_cameras is not None:
+            declared_set = set(episode.declared_cameras)
+            if actual != declared_set:
+                missing = sorted(declared_set - actual)
+                extra = sorted(actual - declared_set)
+                raise ValueError(
+                    f"episode {episode.episode_index}（{episode.episode}）的相机与 "
+                    f"episodes.jsonl 不一致：缺少 {missing}，多出 {extra}"
+                )
+        episode.cameras = canonical_camera_order(actual)
+
+        sequences: Dict[str, List[tuple]] = {}
+        for camera in episode.cameras:
+            rows = episode.frames_by_camera[camera]
+            # 帧必须按 episode 内位置有序，否则写进去的顺序会错乱
+            rows.sort(key=lambda row: row.get("frame_index", 0))
+            positions = [row.get("frame_index") for row in rows]
+            if len(set(positions)) != len(positions):
+                raise ValueError(
+                    f"episode {episode.episode_index}（{episode.episode}）的相机 "
+                    f"{camera} 有重复 frame_index"
+                )
+            sequences[camera] = [
+                (
+                    row.get("frame_index"),
+                    row.get("source_frame"),
+                    row.get("timestamp"),
+                )
+                for row in rows
+            ]
+
+        reference_camera = episode.cameras[0]
+        reference = sequences[reference_camera]
+        for camera in episode.cameras[1:]:
+            other = sequences[camera]
+            if len(other) != len(reference):
+                raise ValueError(
+                    f"episode {episode.episode_index}（{episode.episode}）的相机帧数不同步："
+                    f"{reference_camera}={len(reference)}，{camera}={len(other)}"
+                )
+            for position, (left, right) in enumerate(zip(reference, other)):
+                if left != right:
+                    raise ValueError(
+                        f"episode {episode.episode_index}（{episode.episode}）的相机不同步："
+                        f"第 {position} 个位置 {reference_camera}={left}，{camera}={right}"
+                    )
+        episode.length = len(reference)
+
+        if isinstance(episode.declared_length, int) and not isinstance(
+            episode.declared_length, bool
+        ):
+            if episode.declared_length != episode.length:
+                raise ValueError(
+                    f"episode {episode.episode_index}（{episode.episode}）的 length="
+                    f"{episode.declared_length}，与帧清单的 {episode.length} 不符"
+                )
     return ordered
 
 
-def frame_path(dataset_dir: Path, row: dict) -> Path:
-    """把 frames.jsonl 里的相对路径还原成绝对路径（拼上 dataset/ 根目录）。"""
+def resolve_image_root(
+    dataset_dir: Path, info: dict, override: Optional[str] = None
+) -> Path:
+    """确定第一步图片目录。
+
+    默认读 info.json 的 `extras.image_root`（相对 dataset/ 解析）；`--images-root`
+    可覆盖，方便移动过目录或只保留了清单的情况。
+    """
+    if override:
+        return Path(override).expanduser().resolve()
+    extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
+    raw = extras.get("image_root")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(
+            "info.json 缺少 extras.image_root；请重跑 format_dataset.py，"
+            "或显式传 --images-root"
+        )
+    root = Path(raw).expanduser()
+    return (dataset_dir / root).resolve() if not root.is_absolute() else root.resolve()
+
+
+def frame_path(image_root: Path, row: dict) -> Path:
+    """把 frames.jsonl 里的相对路径拼到第一步图片目录上。"""
     raw = row.get("path")
     if not isinstance(raw, str) or not raw:
         raise ValueError(f"frames.jsonl 里有非法的 path 字段：{row!r}")
     relative = Path(raw)
     if relative.is_absolute():
         raise ValueError(f"frames.jsonl 里的 path 必须是相对路径，实际是 {raw!r}")
-    return dataset_dir / relative
+    return image_root / relative
 
 
 def load_actions(dataset_dir: Path) -> Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]]:
@@ -206,6 +416,24 @@ def action_dim_of(
     return dims.pop()
 
 
+def action_key_for(
+    episode: EpisodeFrames,
+    actions: Dict[str, Tuple[np.ndarray, np.ndarray]],
+) -> Optional[str]:
+    """找到该 episode 的动作侧车键。
+
+    新清单的权威键是 ``episode``；只有旧清单（没有 episode 字段）才回退到
+    ``source_video``，避免多相机目录模式下静默配错动作。
+    """
+    candidates = [episode.episode]
+    if not episode.has_episode_key and episode.source_video is not None:
+        candidates.append(episode.source_video)
+    for key in candidates:
+        if key in actions:
+            return key
+    return None
+
+
 def action_problem(
     episode: EpisodeFrames, row: dict, actions: Dict[str, Tuple[np.ndarray, np.ndarray]]
 ) -> Optional[str]:
@@ -215,69 +443,119 @@ def action_problem(
     有对应动作**。缺的时候报错而不是填 0：静默填 0 等于告诉模型「此刻机器人什么
     也没做」，而且不会报错。
     """
-    entry = actions.get(episode.source_video)
-    if entry is None:
+    key = action_key_for(episode, actions)
+    if key is None:
+        candidates = [episode.episode]
+        if not episode.has_episode_key and episode.source_video is not None:
+            candidates.append(episode.source_video)
         return (
-            f"源视频没有动作文件（{episode.source_video}）。"
-            f"请对它跑 import_actions.py，或把它从素材里排除：{row.get('path')}"
+            f"episode {episode.episode_index}（{episode.episode}）没有动作文件"
+            f"（查找键：{candidates}）。请对它跑 import_actions.py，"
+            f"或把它从素材里排除：{row.get('path')}"
         )
     frame = row.get("source_frame")
     if isinstance(frame, bool) or not isinstance(frame, int):
         return f"帧清单里没有 source_frame，无法与动作对齐：{row.get('path')}"
-    rows = entry[0].shape[0]
+    rows = actions[key][0].shape[0]
     if not 0 <= frame < rows:
         return (
-            f"帧号 {frame} 超出动作范围（该源视频的动作只有 {rows} 行）："
+            f"帧号 {frame} 超出动作范围（{key} 的动作只有 {rows} 行）："
             f"{row.get('path')}。动作文件与视频对不上？"
         )
     return None
 
 
-def precheck_frames(
+def _cameras_for_check(
     episodes: Sequence[EpisodeFrames],
-    dataset_dir: Path,
     height: int,
     width: int,
+) -> List[CameraSpec]:
+    """兼容旧调用的 (height, width)：按清单里的相机名建 spec。"""
+    names = sorted({name for episode in episodes for name in episode.cameras})
+    if not names:
+        names = [DEFAULT_CAMERA]
+    return [
+        CameraSpec(name=name, key=f"observation.images.{name}", height=height, width=width)
+        for name in names
+    ]
+
+
+def precheck_frames(
+    episodes: Sequence[EpisodeFrames],
+    image_root: Path,
+    cameras_or_height,
+    width: Optional[int] = None,
     actions: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> Tuple[int, List[str]]:
-    """落盘前先把所有帧验一遍，返回 (帧总数, 问题列表)。
+    """落盘前先把所有帧验一遍，返回 (同步采样数, 问题列表)。
 
     必须在创建数据集之前做：lerobot 一旦开始写，中途报错会留下半成品目录。
     只读 JPEG 头部，两千多帧约一两秒。
+
+    cameras_or_height 可传 CameraSpec 列表，也可传旧式 height（配合 width）。
     """
+    if isinstance(cameras_or_height, int):
+        if width is None:
+            raise ValueError("旧式调用必须同时传 height 和 width")
+        cameras = _cameras_for_check(episodes, cameras_or_height, width)
+    else:
+        cameras = list(cameras_or_height)
+
+    expected = [camera.name for camera in cameras]
     problems: List[str] = []
     total = 0
     for episode in episodes:
-        for row in episode.frames:
-            path = frame_path(dataset_dir, row)
-            total += 1
-            # blur_score 是必须的：特征一旦声明，lerobot 要求每帧都提供。
-            # 报错而不是填默认值 —— 静默补 0 会让所有帧看起来都模糊。
-            score = row.get("blur_score")
-            if isinstance(score, bool) or not isinstance(score, (int, float)):
-                problems.append(
-                    f"帧清单里没有可用的 blur_score（{score!r}）。"
-                    f"上游是旧版 format_dataset.py？请重跑前两步：{row.get('path')}"
-                )
-                continue
-            if actions is not None:
-                missing_action = action_problem(episode, row, actions)
-                if missing_action:
-                    problems.append(missing_action)
-                    continue
-            if not path.is_file():
-                problems.append(f"帧文件不存在：{path}")
-                continue
-            size = probe_jpeg(path)
-            if size is None:
-                problems.append(f"JPEG 无法解析（损坏？）：{path}")
-            elif size != (width, height):
-                problems.append(
-                    f"尺寸不符（期望 {width}x{height}，实际 {size[0]}x{size[1]}）：{path}"
-                )
+        extra = [name for name in episode.cameras if name not in expected]
+        missing = [name for name in expected if name not in episode.cameras]
+        if extra or missing:
+            problems.append(
+                f"episode {episode.episode_index}（{episode.episode}）的相机与 info.json "
+                f"不一致：缺少 {missing}，多出 {extra}"
+            )
             if len(problems) >= 5:
                 problems.append("……（更多问题已省略）")
                 return total, problems
+            continue
+
+        reference = episode.frames
+        for position, reference_row in enumerate(reference):
+            total += 1
+            if actions is not None:
+                missing_action = action_problem(episode, reference_row, actions)
+                if missing_action:
+                    problems.append(missing_action)
+                    if len(problems) >= 5:
+                        problems.append("……（更多问题已省略）")
+                        return total, problems
+                    continue
+
+            for camera in cameras:
+                row = episode.frames_by_camera[camera.name][position]
+                path = frame_path(image_root, row)
+                # blur_score 是必须的：特征一旦声明，lerobot 要求每帧都提供。
+                # 报错而不是填默认值 —— 静默补 0 会让所有帧看起来都模糊。
+                score = row.get("blur_score")
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    problems.append(
+                        f"帧清单里没有可用的 blur_score（{score!r}，相机 "
+                        f"{camera.name}）。上游是旧版 format_dataset.py？"
+                        f"请重跑前两步：{row.get('path')}"
+                    )
+                    continue
+                if not path.is_file():
+                    problems.append(f"帧文件不存在（相机 {camera.name}）：{path}")
+                    continue
+                size = probe_jpeg(path)
+                if size is None:
+                    problems.append(f"JPEG 无法解析（损坏？）：{path}")
+                elif size != (camera.width, camera.height):
+                    problems.append(
+                        f"尺寸不符（相机 {camera.name} 期望 "
+                        f"{camera.width}x{camera.height}，实际 {size[0]}x{size[1]}）：{path}"
+                    )
+                if len(problems) >= 5:
+                    problems.append("……（更多问题已省略）")
+                    return total, problems
     return total, problems
 
 
@@ -323,7 +601,7 @@ def check_frame_grid(episodes: Sequence[EpisodeFrames], fps: int) -> List[str]:
     """
     warnings: List[str] = []
     for episode in episodes:
-        label = f"episode {episode.episode_index}（{episode.source_video}）"
+        label = f"episode {episode.episode_index}（{episode.episode}）"
         frames = episode.frames
         # source_frame 在 write_dataset 里是可缺省的（退回帧位置），缺了就无从判断间隔。
         # 用默认值 0 硬凑会算出错误的间隔并误报，所以这种情况直接跳过间隔检查。
@@ -373,12 +651,11 @@ def check_frame_grid(episodes: Sequence[EpisodeFrames], fps: int) -> List[str]:
 
 def write_dataset(
     episodes: Sequence[EpisodeFrames],
-    dataset_dir: Path,
+    image_root: Path,
     output_dir: Path,
     repo_id: str,
-    camera_key: str,
-    height: int,
-    width: int,
+    robot_type: str,
+    cameras: Sequence[CameraSpec],
     fps: int,
     task: str,
     total_frames: int,
@@ -386,7 +663,7 @@ def write_dataset(
     actions: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]],
     logger: logging.Logger,
 ) -> int:
-    """调 lerobot 的官方 API 把数据集写出来，返回写入的帧数。"""
+    """调 lerobot 的官方 API 把数据集写出来，返回写入的同步采样数。"""
     # 延迟导入：lerobot 会连带拉起 torch，要好几秒。放函数里，
     # 本模块不碰 lerobot 的纯逻辑测试就能保持秒级。
     from lerobot import __version__ as lerobot_version
@@ -407,11 +684,11 @@ def write_dataset(
         repo_id=repo_id,
         fps=fps,
         features=build_features(
-            camera_key, height, width, action_dim=action_dim_of(actions)
+            cameras, action_dim=action_dim_of(actions)
         ),
         root=output_dir,
         use_videos=True,
-        robot_type="unknown",
+        robot_type=robot_type,
         # 0.6 起编码参数收进 RGBEncoderConfig（0.5 及以前是 create() 的直接参数）。
         # 只传 vcodec，其余保持默认：g=2、crf=30、pix_fmt=yuv420p —— 与旧版一致，
         # 产物不变。将来要调 GOP/质量就改这里。
@@ -433,39 +710,56 @@ def write_dataset(
     try:
         with tqdm(total=total_frames, desc="写入帧", unit="frame") as bar:
             for episode in episodes:
-                for position, row in enumerate(episode.frames):
-                    source = frame_path(dataset_dir, row)
-                    image = Image.open(source)
-                    image.load()  # 立刻读进内存，别让句柄留在文件上
+                action_key = (
+                    action_key_for(episode, actions) if actions is not None else None
+                )
+                if actions is not None and action_key is None:
+                    raise RuntimeError(
+                        f"episode {episode.episode_index}（{episode.episode}）"
+                        "在 precheck 之后仍找不到动作侧车"
+                    )
 
-                    # 声明的是 3 通道；灰度 / CMYK 的 JPEG 必须转成 RGB 才能喂编码器
-                    if image.mode != "RGB":
-                        if not non_rgb_warned:
-                            logger.warning(
-                                "图片不是 RGB 模式（%s：%s），已自动转换；"
-                                "数据集声明的通道数是 3",
-                                source.name,
-                                image.mode,
-                            )
-                            non_rgb_warned = True
-                        image = image.convert("RGB")
-
-                    source_frame = int(row.get("source_frame", position))
+                for position, reference_row in enumerate(episode.frames):
                     frame_data = {
-                        # 流式编码器要的是 numpy 数组（(H,W,C) 或 (C,H,W)），
-                        # 喂 PIL 对象会在编码线程里炸 "no attribute 'shape'"
-                        camera_key: np.asarray(image, dtype=np.uint8),
-                        SOURCE_FRAME_KEY: np.array([source_frame], dtype=np.int64),
-                        BLUR_SCORE_KEY: np.array(
-                            [float(row["blur_score"])], dtype=np.float32
-                        ),
                         # lerobot 每帧必填；没有标注就传空串
                         "task": task,
                     }
+                    blur_scores = []
+                    for camera in cameras:
+                        row = episode.frames_by_camera[camera.name][position]
+                        source = frame_path(image_root, row)
+                        image = Image.open(source)
+                        image.load()  # 立刻读进内存，别让句柄留在文件上
+
+                        # 声明的是 3 通道；灰度 / CMYK 的 JPEG 必须转成 RGB 才能喂编码器
+                        if image.mode != "RGB":
+                            if not non_rgb_warned:
+                                logger.warning(
+                                    "图片不是 RGB 模式（%s：%s），已自动转换；"
+                                    "数据集声明的通道数是 3",
+                                    source.name,
+                                    image.mode,
+                                )
+                                non_rgb_warned = True
+                            image = image.convert("RGB")
+
+                        # 流式编码器要的是 numpy 数组（(H,W,C) 或 (C,H,W)），
+                        # 喂 PIL 对象会在编码线程里炸 "no attribute 'shape'"
+                        frame_data[camera.key] = np.asarray(image, dtype=np.uint8)
+                        blur_scores.append(float(row["blur_score"]))
+
+                    # 同一帧位置各相机共享 source_frame；blur 按相机顺序组成向量
+                    source_frame = int(reference_row.get("source_frame", position))
+                    frame_data[SOURCE_FRAME_KEY] = np.array(
+                        [source_frame], dtype=np.int64
+                    )
+                    frame_data[BLUR_SCORE_KEY] = np.asarray(
+                        blur_scores, dtype=np.float32
+                    )
                     if actions is not None:
                         # 按**源视频帧号**取行，不做步长算术 —— 这也正是 source_frame
                         # 被保留成正式列的原因。范围与存在性已由 precheck 保证。
-                        action, state = actions[episode.source_video]
+                        action, state = actions[action_key]
                         frame_data[ACTION_KEY] = np.asarray(action[source_frame], dtype=np.float32)
                         frame_data[STATE_KEY] = np.asarray(state[source_frame], dtype=np.float32)
                     dataset.add_frame(frame_data)
@@ -475,13 +769,16 @@ def write_dataset(
                 dataset.save_episode()
                 # 必须在 save_episode 之后立刻查：丢帧计数在下一个 start_episode 时清零
                 check_encoder_drops(
-                    dataset, f"episode {episode.episode_index}（{episode.source_video}）", logger
+                    dataset,
+                    f"episode {episode.episode_index}（{episode.episode}）",
+                    logger,
                 )
                 logger.info(
-                    "episode %d（%s）完成：%d 帧",
+                    "episode %d（%s）完成：%d 个采样 × %d 路相机",
                     episode.episode_index,
-                    episode.source_video,
-                    len(episode.frames),
+                    episode.episode,
+                    episode.length,
+                    len(cameras),
                 )
     except Exception:
         logger.exception(
@@ -494,6 +791,241 @@ def write_dataset(
     # 不调 finalize() 就不写 parquet footer，数据集无法加载
     dataset.finalize()
     return written
+
+
+# 自引用 / 纯来源字段不参与内容哈希：否则路径或创建时间一变，版本就变了。
+_HASH_EXCLUDED_FIELDS = {
+    "content_hash",
+    "dataset_version",
+    "created_at",
+    "manifest_status",
+    "source",
+}
+
+
+def _relative_file_index(output_dir: Path) -> List[List[object]]:
+    """数据集文件的相对路径 + 大小；不读文件内容，也不包含 manifest 自身。"""
+    files: List[List[object]] = []
+    for path in sorted(output_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name == MANIFEST_FILENAME or path.name.endswith(".tmp"):
+            continue
+        files.append([path.relative_to(output_dir).as_posix(), path.stat().st_size])
+    return files
+
+
+def _compute_content_hash(
+    manifest: dict, info_bytes: bytes, file_index: Sequence[Sequence[object]]
+) -> str:
+    """sha256(manifest 字段 + info.json 内容 + 相对文件索引)。
+
+    刻意不哈希像素：百万帧级数据的哈希成本不可接受。同一条路径下若像素变了但
+    文件大小没变，hash 可能不变 —— v1 已知限制，README 里写明。
+    """
+    payload = {
+        key: value
+        for key, value in manifest.items()
+        if key not in _HASH_EXCLUDED_FIELDS
+    }
+    payload["info_json_sha256"] = hashlib.sha256(info_bytes).hexdigest()
+    payload["files"] = [list(item) for item in file_index]
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _source_fps_by_camera(info: dict, episodes: Sequence[EpisodeFrames]) -> Dict[str, Optional[float]]:
+    """从 info.extras.sources 取每路相机的原始帧率，缺失时用 episode 级值。"""
+    result: Dict[str, Optional[float]] = {}
+    extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
+    sources = extras.get("sources")
+    if isinstance(sources, list):
+        for source in sources:
+            cameras = source.get("cameras") if isinstance(source, dict) else None
+            if not isinstance(cameras, list):
+                continue
+            for camera in cameras:
+                if not isinstance(camera, dict):
+                    continue
+                name = camera.get("name")
+                if isinstance(name, str) and name not in result:
+                    result[name] = camera.get("orig_fps")
+    for episode in episodes:
+        for name in episode.cameras:
+            result.setdefault(name, episode.source_fps)
+    return result
+
+
+def build_dataset_manifest(
+    args: argparse.Namespace,
+    info: dict,
+    cameras: Sequence[CameraSpec],
+    episodes: Sequence[EpisodeFrames],
+    action_dim: Optional[int],
+    total_samples: int,
+    output_dir: Path,
+) -> dict:
+    """组装数据集权威自描述；字段刻意保持最小、可机读。"""
+    extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
+    fps_by_camera = _source_fps_by_camera(info, episodes)
+
+    stats_raw = args.stats_path or "meta/stats.json"
+    stats_candidate = Path(stats_raw)
+    if not stats_candidate.is_absolute():
+        stats_candidate = output_dir / stats_candidate
+    stats_status = "complete" if stats_candidate.is_file() else "missing"
+
+    split_path = args.split_path
+    if split_path:
+        split_candidate = Path(split_path)
+        if not split_candidate.is_absolute():
+            split_candidate = output_dir / split_candidate
+        if not split_candidate.is_file():
+            raise ValueError(f"--split-path 指向的文件不存在：{split_candidate}")
+
+    num_camera_frames = {
+        camera.name: sum(
+            episode.length for episode in episodes if camera.name in episode.frames_by_camera
+        )
+        for camera in cameras
+    }
+
+    semantic = {
+        "action_space_id": args.action_space_id,
+        "state_space_id": args.state_space_id,
+        "control_mode": args.control_mode,
+        "units": None,
+        "joint_order": None,
+    }
+    unknown = [
+        name
+        for name in ("action_space_id", "state_space_id", "control_mode")
+        if semantic[name] == "unknown"
+    ]
+
+    # 最终 info.json 由 lerobot 生成；中间的 meta/info.json 只用于来源信息。
+    info_path = output_dir / META_DIRNAME / INFO_JSON
+    try:
+        final_info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"读不了最终数据集的 {info_path}：{exc}") from exc
+
+    manifest = {
+        "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
+        "dataset_id": str(args.dataset_id or args.repo_id),
+        "content_hash": None,
+        "content_hash_scope": "manifest_fields+info_json+relative_file_index",
+        "content_hash_algo": "sha256",
+        "created_at": datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
+        "pipeline_version": PIPELINE_VERSION,
+        "lerobot_version": _lerobot_version(),
+        "format_version": str(final_info.get("codebase_version", "unknown")),
+        "repo_id": args.repo_id,
+        "robot_type": args.robot_type,
+        "source": {
+            "root": extras.get("source_root"),
+            "group_by": extras.get("group_by"),
+            "camera_names": extras.get("camera_names") or {},
+            "image_root": extras.get("image_root"),
+        },
+        "num_episodes": len(episodes),
+        "num_samples": total_samples,
+        "num_camera_frames": num_camera_frames,
+        "fps": args.fps or info.get("fps"),
+        "cameras": [
+            {
+                "name": camera.name,
+                "role": "unknown",
+                "shape": [camera.height, camera.width, 3],
+                "source_fps": fps_by_camera.get(camera.name),
+            }
+            for camera in cameras
+        ],
+        "action_dim": action_dim,
+        "state_dim": action_dim,
+        **semantic,
+        "action_schema_path": None,
+        "state_schema_path": None,
+        "stats_path": stats_raw,
+        "stats_status": stats_status,
+        "stats_split": "train",
+        "stats_version": 1,
+        "split_path": split_path,
+        "split_rules": args.split_rules,
+        "recommended_split": args.recommended_split,
+        "suggested_sampling_weight": args.suggested_sampling_weight,
+    }
+
+    info_bytes = info_path.read_bytes()
+    file_index = _relative_file_index(output_dir)
+    content_hash = _compute_content_hash(manifest, info_bytes, file_index)
+    manifest["content_hash"] = content_hash
+    manifest["dataset_version"] = (
+        args.dataset_version or content_hash.split(":", 1)[1][:12]
+    )
+    is_partial = bool(unknown) or semantic["units"] is None or semantic["joint_order"] is None
+    manifest["manifest_status"] = "partial" if is_partial else "complete"
+    manifest["_unknown_fields"] = unknown  # 仅供日志，写盘前删除
+    if stats_status != "complete":
+        manifest["_stats_missing"] = True
+    return manifest
+
+
+def _lerobot_version() -> str:
+    """读包版本，不 import lerobot —— import 会连带拉起 torch。"""
+    try:
+        return str(package_version("lerobot"))
+    except PackageNotFoundError:
+        return "unknown"
+    except Exception:  # 版本号拿不到不该让 manifest 生成失败
+        return "unknown"
+
+
+def write_dataset_manifest(
+    args: argparse.Namespace,
+    info: dict,
+    cameras: Sequence[CameraSpec],
+    episodes: Sequence[EpisodeFrames],
+    action_dim: Optional[int],
+    total_samples: int,
+    output_dir: Path,
+    logger: logging.Logger,
+) -> int:
+    """写 dataset_manifest.json；失败返回 1。"""
+    manifest = build_dataset_manifest(
+        args, info, cameras, episodes, action_dim, total_samples, output_dir
+    )
+    unknown = manifest.pop("_unknown_fields", [])
+    stats_missing = manifest.pop("_stats_missing", False)
+
+    if manifest["manifest_status"] != "complete":
+        logger.warning(
+            "manifest_status=partial：这些语义字段仍是 unknown：%s；"
+            "跨机器人动作映射训练前必须补齐",
+            unknown or ["units", "joint_order"],
+        )
+    if stats_missing:
+        logger.warning(
+            "manifest 记录的统计文件不存在（%s）；训练侧不能依赖它",
+            manifest["stats_path"],
+        )
+
+    path = output_dir / MANIFEST_FILENAME
+    if not atomic_write_json(path, manifest, logger):
+        logger.error("数据集已写出，但 manifest 写入失败：%s", path)
+        return 1
+    logger.info(
+        "数据集自描述：%s（id=%s version=%s status=%s）",
+        path,
+        manifest["dataset_id"],
+        manifest["dataset_version"],
+        manifest["manifest_status"],
+    )
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -512,7 +1044,14 @@ def parse_args() -> argparse.Namespace:
         help=f"数据集标识（lerobot 必填，本质是 HF Hub 路径格式；默认 {DEFAULT_REPO_ID}）",
     )
     parser.add_argument(
-        "--camera", default=DEFAULT_CAMERA, help=f"相机名，对应 observation.images.<camera>（默认 {DEFAULT_CAMERA}）"
+        "--camera",
+        default=None,
+        help="只导出指定相机（仅单相机清单可用）；缺省导出 info.json 声明的全部相机",
+    )
+    parser.add_argument(
+        "--images-root",
+        default=None,
+        help="第一步的图片目录；缺省时读 info.json 的 extras.image_root",
     )
     parser.add_argument(
         "--fps", type=int, default=None, help="处理帧率；缺省时沿用第二步 info.json 里的值"
@@ -524,11 +1063,65 @@ def parse_args() -> argparse.Namespace:
         "--vcodec",
         default="h264",
         help="视频编码器：h264/hevc/libsvtav1/auto，或硬件编码器名（默认 h264）。"
-        "libsvtav1 解码约为图片的 5 倍慢、h264 约 2.2 倍，训练取数时差别明显；"
+        "libsvtav1 压缩率更高但编码/解码更慢；"
         "auto 会选硬件编码器（编码更快，但对小尺寸帧会失败）",
     )
     parser.add_argument(
         "--force", action="store_true", help="输出目录已存在时整目录删掉重建"
+    )
+
+    # ---- 数据集自描述（dataset_manifest.json）----
+    parser.add_argument(
+        "--dataset-id",
+        default=None,
+        help="数据集的稳定逻辑 ID；缺省用 --repo-id。多数据集场景建议显式指定",
+    )
+    parser.add_argument(
+        "--dataset-version",
+        default=None,
+        help="物理版本号；缺省取 content_hash 前 12 位",
+    )
+    parser.add_argument(
+        "--robot-type", default="unknown", help="机器人类型（写入 manifest 与 lerobot info）"
+    )
+    parser.add_argument(
+        "--action-space-id",
+        default="unknown",
+        help="动作空间语义标识；不知道就保持 unknown（manifest 会标 partial）",
+    )
+    parser.add_argument(
+        "--state-space-id",
+        default="unknown",
+        help="状态空间语义标识；不知道就保持 unknown",
+    )
+    parser.add_argument(
+        "--control-mode",
+        default="unknown",
+        help="控制模式（如 joint_position）；不知道就保持 unknown",
+    )
+    parser.add_argument(
+        "--stats-path",
+        default="meta/stats.json",
+        help="统计文件路径（相对输出目录或绝对；默认 meta/stats.json）",
+    )
+    parser.add_argument(
+        "--split-path", default=None, help="显式 split 文件路径（可选）"
+    )
+    parser.add_argument(
+        "--split-rules",
+        default="by_episode",
+        help="split 规则说明（默认 by_episode）",
+    )
+    parser.add_argument(
+        "--recommended-split",
+        default="train",
+        help="建议训练侧使用的 split（默认 train）",
+    )
+    parser.add_argument(
+        "--suggested-sampling-weight",
+        type=float,
+        default=1.0,
+        help="训练侧采样权重建议（默认 1.0，可被训练配置覆盖）",
     )
     return parser.parse_args()
 
@@ -539,7 +1132,6 @@ def main() -> int:
 
     dataset_dir = Path(args.input)
     output_dir = Path(args.output)
-    camera_key = f"observation.images.{args.camera}"
 
     if not dataset_dir.is_dir():
         logger.error("输入目录不存在或不是目录：%s", dataset_dir)
@@ -553,8 +1145,11 @@ def main() -> int:
         episode_rows = read_jsonl(
             dataset_dir / META_DIRNAME / EPISODES_JSONL, missing_hint="请先跑 format_dataset.py"
         )
-        height, width = resolve_camera_shape(info, camera_key)
-        episodes = group_episodes(frames, episode_rows)
+        cameras = resolve_cameras(info, args.camera)
+        image_root = resolve_image_root(dataset_dir, info, args.images_root)
+        episodes = group_episodes(
+            frames, episode_rows, camera_names=[camera.name for camera in cameras]
+        )
         # 自动发现，不做成开关：「有没有动作」是事实而不是选择
         actions = load_actions(dataset_dir)
         action_dim = action_dim_of(actions)
@@ -562,16 +1157,24 @@ def main() -> int:
         logger.error("%s", exc)
         return 1
 
+    if not image_root.is_dir():
+        logger.error(
+            "图片目录不存在：%s。请检查 info.json 的 extras.image_root，"
+            "或用 --images-root 指定第一步的 output/images",
+            image_root,
+        )
+        return 1
+
     if actions is None:
         logger.info(
             "未发现动作侧车（%s/meta/%s/），数据集不含 action/observation.state —— "
-            "「能不能训练」只剩 observation，见 README「已知限制 1」",
+            "「能不能训练」只剩 observation，见 README「已知限制」",
             dataset_dir,
             ACTIONS_DIRNAME,
         )
     else:
         logger.info(
-            "发现 %d 个源视频的动作侧车（%d 维），数据集将带上 action/observation.state",
+            "发现 %d 个 episode 的动作侧车（%d 维），数据集将带上 action/observation.state",
             len(actions),
             action_dim,
         )
@@ -598,10 +1201,29 @@ def main() -> int:
     if not str(args.repo_id).strip():
         logger.error("--repo-id 不能为空")
         return 1
+    if args.dataset_id is not None and not str(args.dataset_id).strip():
+        logger.error("--dataset-id 不能为空字符串")
+        return 1
+    if args.dataset_version is not None and not str(args.dataset_version).strip():
+        logger.error("--dataset-version 不能为空字符串")
+        return 1
+    if not str(args.robot_type).strip():
+        logger.error("--robot-type 不能为空")
+        return 1
+    if args.suggested_sampling_weight <= 0:
+        logger.error("--suggested-sampling-weight 必须大于 0")
+        return 1
+    if args.split_path:
+        split_candidate = Path(args.split_path)
+        if not split_candidate.is_absolute():
+            split_candidate = output_dir / split_candidate
+        if not split_candidate.is_file():
+            logger.error("--split-path 指向的文件不存在：%s", split_candidate)
+            return 1
 
     # 校验必须在删旧目录之前：--force 会整个删掉已有数据集，若输入有问题就白丢了
     total_frames, problems = precheck_frames(
-        episodes, dataset_dir, height, width, actions=actions
+        episodes, image_root, cameras, actions=actions
     )
     if problems:
         logger.error("有 %d 个帧文件不可用，未开始写入：", len(problems))
@@ -627,14 +1249,21 @@ def main() -> int:
             return 1
 
     logger.info(
-        "准备写入：%d 个 episode，%d 帧，%dx%d，fps=%d，相机=%s",
+        "准备写入：%d 个 episode，%d 个同步采样，%d 路相机，fps=%d，图片目录=%s",
         len(episodes),
         total_frames,
-        width,
-        height,
+        len(cameras),
         fps,
-        camera_key,
+        image_root,
     )
+    for camera in cameras:
+        logger.info(
+            "  相机 %s：%dx%d（%s）",
+            camera.name,
+            camera.width,
+            camera.height,
+            camera.key,
+        )
     if not args.task:
         logger.info("--task 为空，meta/tasks.parquet 里会是一行空任务（表示没有标注）")
 
@@ -642,12 +1271,11 @@ def main() -> int:
     try:
         written = write_dataset(
             episodes=episodes,
-            dataset_dir=dataset_dir,
+            image_root=image_root,
             output_dir=output_dir,
             repo_id=args.repo_id,
-            camera_key=camera_key,
-            height=height,
-            width=width,
+            robot_type=args.robot_type,
+            cameras=cameras,
             fps=fps,
             task=args.task,
             total_frames=total_frames,
@@ -656,6 +1284,22 @@ def main() -> int:
             logger=logger,
         )
     except Exception:
+        return 1
+
+    try:
+        if write_dataset_manifest(
+            args,
+            info,
+            cameras,
+            episodes,
+            action_dim,
+            total_frames,
+            output_dir,
+            logger,
+        ):
+            return 1
+    except (OSError, ValueError):
+        logger.exception("生成 dataset_manifest.json 失败")
         return 1
 
     elapsed = time.time() - start_ts

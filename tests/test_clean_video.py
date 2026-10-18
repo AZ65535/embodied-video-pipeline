@@ -6,6 +6,7 @@
 
 import json
 import logging
+import sys
 from pathlib import Path
 
 import cv2
@@ -135,6 +136,126 @@ def test_assign_output_names_rejects_unavoidable_collision(tmp_path):
     videos = [tmp_path / "a_1.mp4", tmp_path / "a" / "1.mp4"]
     with pytest.raises(ValueError, match="输出名冲突"):
         clean_video.assign_output_names(videos, tmp_path)
+
+
+# --------------------------------------------------------------------------
+# 分组计划（多相机）
+# --------------------------------------------------------------------------
+
+
+def touch_videos(root: Path, names: list) -> list:
+    paths = []
+    for name in names:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+        paths.append(path)
+    return paths
+
+
+def test_build_video_plans_file_mode_keeps_one_video_per_episode(tmp_path):
+    videos = touch_videos(tmp_path, ["a.mp4", "sub/b.mp4"])
+    plans = clean_video.build_video_plans(
+        videos, tmp_path, "file", None, {}
+    )
+    assert [(plan.episode, plan.camera) for plan in plans] == [
+        ("a", "front"),
+        ("sub_b", "front"),
+    ]
+
+
+def test_build_video_plans_dir_mode_groups_same_directory_as_cameras(tmp_path):
+    videos = touch_videos(
+        tmp_path,
+        ["ep1/18026681.mp4", "ep1/22008760.mp4", "ep2/18026681.mp4", "ep2/22008760.mp4"],
+    )
+    plans = clean_video.build_video_plans(videos, tmp_path, "dir", None, {})
+    by_episode = {}
+    for plan in plans:
+        by_episode.setdefault(plan.episode, []).append(plan.camera)
+    assert by_episode == {
+        "ep1": ["18026681", "22008760"],
+        "ep2": ["18026681", "22008760"],
+    }
+    assert {plan.episode_dir for plan in plans} == {"ep1", "ep2"}
+
+
+def test_build_video_plans_dir_mode_applies_name_mapping(tmp_path):
+    videos = touch_videos(tmp_path, ["ep1/1.mp4", "ep1/2.mp4"])
+    plans = clean_video.build_video_plans(
+        videos, tmp_path, "dir", None, {"1": "left", "2": "right"}
+    )
+    assert sorted(plan.camera for plan in plans) == ["left", "right"]
+
+
+def test_build_video_plans_dir_mode_rejects_inconsistent_camera_sets(tmp_path):
+    videos = touch_videos(tmp_path, ["ep1/a.mp4", "ep1/b.mp4", "ep2/a.mp4"])
+    with pytest.raises(ValueError, match="相机集合不一致"):
+        clean_video.build_video_plans(videos, tmp_path, "dir", None, {})
+
+
+def test_build_video_plans_rejects_duplicate_camera_after_mapping(tmp_path):
+    videos = touch_videos(tmp_path, ["ep1/a.mp4", "ep1/b.mp4"])
+    with pytest.raises(ValueError, match="相机名有重复"):
+        clean_video.build_video_plans(
+            videos, tmp_path, "dir", None, {"a": "cam", "b": "cam"}
+        )
+
+
+def test_build_video_plans_rejects_invalid_camera_name(tmp_path):
+    videos = touch_videos(tmp_path, ["a.mp4"])
+    with pytest.raises(ValueError, match="相机名"):
+        clean_video.build_video_plans(videos, tmp_path, "dir", None, {"a": "a/b"})
+
+
+def test_build_video_plans_root_episode_is_underscore_root(tmp_path):
+    videos = touch_videos(tmp_path, ["a.mp4", "b.mp4"])
+    plans = clean_video.build_video_plans(videos, tmp_path, "dir", None, {})
+    assert {plan.episode for plan in plans} == {"_root"}
+    assert {plan.episode_dir for plan in plans} == {"."}
+
+
+@pytest.fixture
+def run_clean(monkeypatch):
+    def _run(*args) -> int:
+        monkeypatch.setattr(sys, "argv", ["clean_video.py", *[str(a) for a in args]])
+        return clean_video.main()
+
+    return _run
+
+
+def test_dir_mode_end_to_end_writes_synced_episode_meta(make_video, tmp_path, run_clean):
+    root = tmp_path / "videos"
+    make_video("videos/ep1/a.mp4", [sharp_frame() for _ in range(12)])
+    make_video("videos/ep1/b.mp4", [sharp_frame() for _ in range(12)])
+
+    out = tmp_path / "output"
+    assert run_clean(
+        "--input", root, "--output", out, "--group-by", "dir", "--fps", "5"
+    ) == 0
+
+    images = out / "images"
+    payload = read_meta(images)
+    assert payload["group_by"] == "dir"
+    assert payload["source_root"] == str(root.resolve())
+    assert payload["cameras"] == ["a", "b"]
+    assert set(payload["episodes"]) == {"ep1"}
+    assert payload["episodes"]["ep1"]["cameras"] == {"a": "ep1_a", "b": "ep1_b"}
+    assert payload["videos"]["ep1_a"]["episode"] == "ep1"
+    assert payload["videos"]["ep1_a"]["camera"] == "a"
+    assert payload["videos"]["ep1_b"]["camera"] == "b"
+    # 两个相机各 2 帧
+    assert len(read_scores(images)) == 4
+
+
+def test_dir_mode_rejects_explicit_camera(make_video, tmp_path, run_clean, caplog):
+    make_video("videos/ep1/a.mp4", [sharp_frame() for _ in range(12)])
+    with caplog.at_level(logging.ERROR):
+        assert run_clean(
+            "--input", tmp_path / "videos", "--output", tmp_path / "out",
+            "--group-by", "dir", "--camera", "front",
+        ) == 1
+    assert "不能同时传 --camera" in caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -283,7 +404,7 @@ def test_write_images_meta_records_rates_and_parameters(images_dir):
     clean_video.write_images_meta(images_dir, {"1": 30.0}, 5, [fake_result("1", scores=scores)])
 
     payload = read_meta(images_dir)
-    assert payload["format"] == 2
+    assert payload["format"] == 3
     assert payload["target_fps"] == 5
     # 阈值概念已移到 format_dataset.py，第一步不再记录
     assert "blur_threshold" not in payload
