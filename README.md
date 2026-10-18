@@ -27,6 +27,10 @@ videos/*.mp4 ──①clean_video.py──▶ output/images/*.jpg ──②forma
 LeRobot 数据集。`import_actions.py` 排在第二步之后、第三步之前——它只写 `dataset/meta/actions/`，
 不碰别的产物。
 
+脚本之间共用的产物文件名、清单字段和纯工具（帧文件名解析、JPEG 头解析、模糊判定、JSON
+读写）集中在 `pipeline_common.py`。它**只依赖标准库**，所以第二步、标定工具和动作导入都
+不会因为 import 公共层而被动拉起 cv2。
+
 **模糊帧一律保留，只做标记。** 被丢弃的帧会让时间轴出现空洞，而 lerobot 的整套时序逻辑
 都假设帧等间隔排列 —— 空洞会让它的 `delta_timestamps` 静默取到错误的时间点。因此过滤是
 **下游的事**：数据集里带一列 `blur_score`，用不用、阈值设多少，由消费方决定。
@@ -58,6 +62,44 @@ pip install -r requirements.txt
 ```bash
 pip install -r requirements.txt -i https://pypi.org/simple/
 ```
+
+## 快速开始
+
+装好依赖后，一条命令跑完三步：
+
+```bash
+python run_pipeline.py --input videos
+```
+
+```
+videos/ ──①──▶ output/images/ ──②──▶ dataset/ ──③──▶ lerobot_dataset/
+```
+
+任何一步失败都会立刻停下，已生成的产物保留；修好后可以接着跑。常用开关：
+
+| 参数 | 说明 |
+|---|---|
+| `--skip-existing` | 跳过产物已完成的步骤（不会处理新增素材） |
+| `--force` | 允许覆盖已有产物（第三步会整个目录删掉重建） |
+| `--dry-run` | 只打印将执行的命令，不执行 |
+| `--blur-threshold` / `--max-episode-seconds` / `--link-mode` | 透传给第二步 |
+| `--camera` / `--task` / `--vcodec` / `--repo-id` | 透传给第三步（`--camera` 同时用于第二步） |
+
+需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面三个脚本和辅助工具。
+
+## 可视化界面（可选）
+
+```bash
+python -m pip install -r requirements-ui.txt
+python ui.py
+```
+
+浏览器打开终端打印的 `http://127.0.0.1:7860`（端口被占用时会顺延）。两个页面：
+
+- **运行管线**：填输入/输出目录，勾选要跑的步骤，运行/停止，实时看日志。第 2 步完成后会自动刷新数据集摘要（episode 数、帧数、阈值、尺寸、每源视频分布、磁盘占用），也可以在跑第 3 步前手动刷新做预检。
+- **模糊复核**：读取 `<第 1 步输出根目录>/images/_scores.jsonl`，按分数浏览缩略图，拖动阈值实时看各视频的标记比例；确认后可一键用该阈值重跑第 2 步（只改 `is_blurry`，不删帧）。
+
+界面只监听 `127.0.0.1`，不上传数据；Gradio 是可选依赖，不装也不影响三步 CLI 和 `run_pipeline.py`。若 pip 镜像超时，加 `-i https://pypi.org/simple/`。部分 Windows 环境的系统代理会拦截 Gradio 的 localhost 健康检查，`ui.py` 已自动把 `127.0.0.1,localhost` 加入 `NO_PROXY`。
 
 ---
 
@@ -534,7 +576,7 @@ Laplacian 方差分布通常不是双峰的，任何自动选阈值的做法都�
 ## 测试
 
 ```bash
-pytest            # 186 个用例，约 2 秒
+pytest            # 226 个用例，约 5 秒
 pytest -m slow    # 8 个用例，含真实调用 lerobot，约 10 秒
 ```
 

@@ -1,3 +1,6 @@
+# 可选：本地网页界面（ui.py）需要额外的 Gradio，见 requirements-ui.txt。
+# 核心三步管线不依赖它。
+
 # 前两步（clean_video.py / format_dataset.py）
 opencv-python
 numpy

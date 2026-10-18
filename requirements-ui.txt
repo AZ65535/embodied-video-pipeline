@@ -1,0 +1,4 @@
+# 可选：本地网页界面（ui.py）。
+# 核心三步管线不需要 Gradio；请先按 requirements.txt 安装管线依赖。
+# 实际验证版本：Python 3.12 + gradio 6.29.1。
+gradio==6.29.1
