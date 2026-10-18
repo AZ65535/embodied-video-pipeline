@@ -89,7 +89,6 @@ class UiConfig:
     repo_id: str = DEFAULT_REPO_ID
     group_by: str = "file"  # file | dir
     camera_names: str = ""  # 相机名映射 JSON 路径；空=不指定
-    dataset_id: str = ""  # 空=沿用 repo_id
     robot_type: str = ""  # 空=export_lerobot 的默认 unknown
     selected_steps: Tuple[int, ...] = (1, 2, 3)
     mode: str = "normal"  # normal | force | skip-existing
@@ -153,7 +152,6 @@ def config_from_form(
     mode,
     group_by="file",
     camera_names="",
-    dataset_id="",
     robot_type="",
 ) -> UiConfig:
     """把 Gradio 表单值转成配置；非法数字会变成可被校验捕获的值。"""
@@ -176,7 +174,6 @@ def config_from_form(
         repo_id=str(repo_id or "").strip(),
         group_by=str(group_by or "file").strip() or "file",
         camera_names=str(camera_names or "").strip(),
-        dataset_id=str(dataset_id or "").strip(),
         robot_type=str(robot_type or "").strip(),
         selected_steps=selected,
         mode=str(mode or "normal"),
@@ -213,7 +210,6 @@ def to_namespace(config: UiConfig, paths: ResolvedPaths) -> argparse.Namespace:
         repo_id=config.repo_id,
         group_by=config.group_by,
         camera_names=config.camera_names or None,
-        dataset_id=config.dataset_id or None,
         robot_type=config.robot_type or None,
         force=config.mode == "force",
         skip_existing=config.mode == "skip-existing",

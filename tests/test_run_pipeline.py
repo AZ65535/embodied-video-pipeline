@@ -102,22 +102,11 @@ def test_camera_names_is_forwarded_to_steps_1_and_2(tmp_path):
     assert "--camera-names" not in steps[2].cmd
 
 
-def test_dataset_id_and_robot_type_go_to_step_3_only(tmp_path):
-    _, steps = steps_for(
-        tmp_path, "--dataset-id", "droid_autolab", "--robot-type", "droid"
-    )
-    assert value_after(steps[2].cmd, "--dataset-id") == "droid_autolab"
+def test_robot_type_goes_to_step_3_only(tmp_path):
+    _, steps = steps_for(tmp_path, "--robot-type", "droid")
     assert value_after(steps[2].cmd, "--robot-type") == "droid"
     for step in steps[:2]:
-        assert "--dataset-id" not in step.cmd
         assert "--robot-type" not in step.cmd
-
-
-def test_step_3_requires_manifest_as_done_marker(tmp_path):
-    _, steps = steps_for(tmp_path)
-    names = [path.name for path in steps[2].done_markers]
-    assert "info.json" in names
-    assert "dataset_manifest.json" in names
 
 
 def test_skip_existing_skips_completed_steps(tmp_path):

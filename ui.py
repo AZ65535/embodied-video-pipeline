@@ -268,7 +268,6 @@ def _rerun_fn(
     force,
     group_by="file",
     camera_names="",
-    dataset_id="",
     robot_type="",
 ):
     fallback = h.config_from_form(
@@ -289,7 +288,6 @@ def _rerun_fn(
         "normal",
         group_by,
         camera_names,
-        dataset_id,
         robot_type,
     )
     config = h.config_for_format_rerun(
@@ -401,11 +399,6 @@ def build_ui():
                             )
                             repo_id = gr.Textbox(
                                 label="repo-id", value=h.DEFAULT_REPO_ID
-                            )
-                            dataset_id = gr.Textbox(
-                                label="dataset-id（可选）",
-                                value="",
-                                info="留空则沿用 repo-id；多数据集场景建议填写",
                             )
                             robot_type = gr.Textbox(
                                 label="robot-type（可选）",
@@ -519,7 +512,6 @@ def build_ui():
             mode,
             group_by,
             camera_names,
-            dataset_id,
             robot_type,
         ]
         review_inputs = [output_base, threshold, band, video_filter, sample_size]
@@ -539,7 +531,6 @@ def build_ui():
             rerun_force,
             group_by,
             camera_names,
-            dataset_id,
             robot_type,
         ]
 

@@ -6,20 +6,16 @@
     dataset/ ──export_lerobot.py──▶ lerobot_dataset/
 
 meta/ 下的 parquet 和 info.json 全部由 lerobot 自己生成，格式正确性由官方代码保证。
-导出结束后额外写 `dataset_manifest.json`（本管线自己的权威自描述）。与上游的差异、
-以及本脚本做不到的事情，见 README 的「第三步」。
+与上游的差异、以及本脚本做不到的事情，见 README 的「第三步」。
 """
 
 import argparse
-import hashlib
 import json
 import logging
 import shutil
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -32,19 +28,15 @@ from pipeline_common import (
     ACTION_ARRAY,
     ACTION_KEY,
     BLUR_SCORE_KEY,
-    DATASET_MANIFEST_SCHEMA_VERSION,
     DEFAULT_CAMERA,
     DEFAULT_REPO_ID,
     EPISODES_JSONL,
     FRAMES_JSONL,
     INFO_JSON,
-    MANIFEST_FILENAME,
     META_DIRNAME,
-    PIPELINE_VERSION,
     SOURCE_FRAME_KEY,
     STATE_ARRAY,
     STATE_KEY,
-    atomic_write_json,
     canonical_camera_order,
     probe_jpeg,
     read_jsonl,
@@ -793,241 +785,6 @@ def write_dataset(
     return written
 
 
-# 自引用 / 纯来源字段不参与内容哈希：否则路径或创建时间一变，版本就变了。
-_HASH_EXCLUDED_FIELDS = {
-    "content_hash",
-    "dataset_version",
-    "created_at",
-    "manifest_status",
-    "source",
-}
-
-
-def _relative_file_index(output_dir: Path) -> List[List[object]]:
-    """数据集文件的相对路径 + 大小；不读文件内容，也不包含 manifest 自身。"""
-    files: List[List[object]] = []
-    for path in sorted(output_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        if path.name == MANIFEST_FILENAME or path.name.endswith(".tmp"):
-            continue
-        files.append([path.relative_to(output_dir).as_posix(), path.stat().st_size])
-    return files
-
-
-def _compute_content_hash(
-    manifest: dict, info_bytes: bytes, file_index: Sequence[Sequence[object]]
-) -> str:
-    """sha256(manifest 字段 + info.json 内容 + 相对文件索引)。
-
-    刻意不哈希像素：百万帧级数据的哈希成本不可接受。同一条路径下若像素变了但
-    文件大小没变，hash 可能不变 —— v1 已知限制，README 里写明。
-    """
-    payload = {
-        key: value
-        for key, value in manifest.items()
-        if key not in _HASH_EXCLUDED_FIELDS
-    }
-    payload["info_json_sha256"] = hashlib.sha256(info_bytes).hexdigest()
-    payload["files"] = [list(item) for item in file_index]
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
-def _source_fps_by_camera(info: dict, episodes: Sequence[EpisodeFrames]) -> Dict[str, Optional[float]]:
-    """从 info.extras.sources 取每路相机的原始帧率，缺失时用 episode 级值。"""
-    result: Dict[str, Optional[float]] = {}
-    extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
-    sources = extras.get("sources")
-    if isinstance(sources, list):
-        for source in sources:
-            cameras = source.get("cameras") if isinstance(source, dict) else None
-            if not isinstance(cameras, list):
-                continue
-            for camera in cameras:
-                if not isinstance(camera, dict):
-                    continue
-                name = camera.get("name")
-                if isinstance(name, str) and name not in result:
-                    result[name] = camera.get("orig_fps")
-    for episode in episodes:
-        for name in episode.cameras:
-            result.setdefault(name, episode.source_fps)
-    return result
-
-
-def build_dataset_manifest(
-    args: argparse.Namespace,
-    info: dict,
-    cameras: Sequence[CameraSpec],
-    episodes: Sequence[EpisodeFrames],
-    action_dim: Optional[int],
-    total_samples: int,
-    output_dir: Path,
-) -> dict:
-    """组装数据集权威自描述；字段刻意保持最小、可机读。"""
-    extras = info.get("extras") if isinstance(info.get("extras"), dict) else {}
-    fps_by_camera = _source_fps_by_camera(info, episodes)
-
-    stats_raw = args.stats_path or "meta/stats.json"
-    stats_candidate = Path(stats_raw)
-    if not stats_candidate.is_absolute():
-        stats_candidate = output_dir / stats_candidate
-    stats_status = "complete" if stats_candidate.is_file() else "missing"
-
-    split_path = args.split_path
-    if split_path:
-        split_candidate = Path(split_path)
-        if not split_candidate.is_absolute():
-            split_candidate = output_dir / split_candidate
-        if not split_candidate.is_file():
-            raise ValueError(f"--split-path 指向的文件不存在：{split_candidate}")
-
-    num_camera_frames = {
-        camera.name: sum(
-            episode.length for episode in episodes if camera.name in episode.frames_by_camera
-        )
-        for camera in cameras
-    }
-
-    semantic = {
-        "action_space_id": args.action_space_id,
-        "state_space_id": args.state_space_id,
-        "control_mode": args.control_mode,
-        "units": None,
-        "joint_order": None,
-    }
-    unknown = [
-        name
-        for name in ("action_space_id", "state_space_id", "control_mode")
-        if semantic[name] == "unknown"
-    ]
-
-    # 最终 info.json 由 lerobot 生成；中间的 meta/info.json 只用于来源信息。
-    info_path = output_dir / META_DIRNAME / INFO_JSON
-    try:
-        final_info = json.loads(info_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"读不了最终数据集的 {info_path}：{exc}") from exc
-
-    manifest = {
-        "schema_version": DATASET_MANIFEST_SCHEMA_VERSION,
-        "dataset_id": str(args.dataset_id or args.repo_id),
-        "content_hash": None,
-        "content_hash_scope": "manifest_fields+info_json+relative_file_index",
-        "content_hash_algo": "sha256",
-        "created_at": datetime.now(timezone.utc)
-        .isoformat(timespec="seconds")
-        .replace("+00:00", "Z"),
-        "pipeline_version": PIPELINE_VERSION,
-        "lerobot_version": _lerobot_version(),
-        "format_version": str(final_info.get("codebase_version", "unknown")),
-        "repo_id": args.repo_id,
-        "robot_type": args.robot_type,
-        "source": {
-            "root": extras.get("source_root"),
-            "group_by": extras.get("group_by"),
-            "camera_names": extras.get("camera_names") or {},
-            "image_root": extras.get("image_root"),
-        },
-        "num_episodes": len(episodes),
-        "num_samples": total_samples,
-        "num_camera_frames": num_camera_frames,
-        "fps": args.fps or info.get("fps"),
-        "cameras": [
-            {
-                "name": camera.name,
-                "role": "unknown",
-                "shape": [camera.height, camera.width, 3],
-                "source_fps": fps_by_camera.get(camera.name),
-            }
-            for camera in cameras
-        ],
-        "action_dim": action_dim,
-        "state_dim": action_dim,
-        **semantic,
-        "action_schema_path": None,
-        "state_schema_path": None,
-        "stats_path": stats_raw,
-        "stats_status": stats_status,
-        "stats_split": "train",
-        "stats_version": 1,
-        "split_path": split_path,
-        "split_rules": args.split_rules,
-        "recommended_split": args.recommended_split,
-        "suggested_sampling_weight": args.suggested_sampling_weight,
-    }
-
-    info_bytes = info_path.read_bytes()
-    file_index = _relative_file_index(output_dir)
-    content_hash = _compute_content_hash(manifest, info_bytes, file_index)
-    manifest["content_hash"] = content_hash
-    manifest["dataset_version"] = (
-        args.dataset_version or content_hash.split(":", 1)[1][:12]
-    )
-    is_partial = bool(unknown) or semantic["units"] is None or semantic["joint_order"] is None
-    manifest["manifest_status"] = "partial" if is_partial else "complete"
-    manifest["_unknown_fields"] = unknown  # 仅供日志，写盘前删除
-    if stats_status != "complete":
-        manifest["_stats_missing"] = True
-    return manifest
-
-
-def _lerobot_version() -> str:
-    """读包版本，不 import lerobot —— import 会连带拉起 torch。"""
-    try:
-        return str(package_version("lerobot"))
-    except PackageNotFoundError:
-        return "unknown"
-    except Exception:  # 版本号拿不到不该让 manifest 生成失败
-        return "unknown"
-
-
-def write_dataset_manifest(
-    args: argparse.Namespace,
-    info: dict,
-    cameras: Sequence[CameraSpec],
-    episodes: Sequence[EpisodeFrames],
-    action_dim: Optional[int],
-    total_samples: int,
-    output_dir: Path,
-    logger: logging.Logger,
-) -> int:
-    """写 dataset_manifest.json；失败返回 1。"""
-    manifest = build_dataset_manifest(
-        args, info, cameras, episodes, action_dim, total_samples, output_dir
-    )
-    unknown = manifest.pop("_unknown_fields", [])
-    stats_missing = manifest.pop("_stats_missing", False)
-
-    if manifest["manifest_status"] != "complete":
-        logger.warning(
-            "manifest_status=partial：这些语义字段仍是 unknown：%s；"
-            "跨机器人动作映射训练前必须补齐",
-            unknown or ["units", "joint_order"],
-        )
-    if stats_missing:
-        logger.warning(
-            "manifest 记录的统计文件不存在（%s）；训练侧不能依赖它",
-            manifest["stats_path"],
-        )
-
-    path = output_dir / MANIFEST_FILENAME
-    if not atomic_write_json(path, manifest, logger):
-        logger.error("数据集已写出，但 manifest 写入失败：%s", path)
-        return 1
-    logger.info(
-        "数据集自描述：%s（id=%s version=%s status=%s）",
-        path,
-        manifest["dataset_id"],
-        manifest["dataset_version"],
-        manifest["manifest_status"],
-    )
-    return 0
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="把 format_dataset.py 的产物组装成 lerobot v3.0 格式的数据集。"
@@ -1070,58 +827,8 @@ def parse_args() -> argparse.Namespace:
         "--force", action="store_true", help="输出目录已存在时整目录删掉重建"
     )
 
-    # ---- 数据集自描述（dataset_manifest.json）----
     parser.add_argument(
-        "--dataset-id",
-        default=None,
-        help="数据集的稳定逻辑 ID；缺省用 --repo-id。多数据集场景建议显式指定",
-    )
-    parser.add_argument(
-        "--dataset-version",
-        default=None,
-        help="物理版本号；缺省取 content_hash 前 12 位",
-    )
-    parser.add_argument(
-        "--robot-type", default="unknown", help="机器人类型（写入 manifest 与 lerobot info）"
-    )
-    parser.add_argument(
-        "--action-space-id",
-        default="unknown",
-        help="动作空间语义标识；不知道就保持 unknown（manifest 会标 partial）",
-    )
-    parser.add_argument(
-        "--state-space-id",
-        default="unknown",
-        help="状态空间语义标识；不知道就保持 unknown",
-    )
-    parser.add_argument(
-        "--control-mode",
-        default="unknown",
-        help="控制模式（如 joint_position）；不知道就保持 unknown",
-    )
-    parser.add_argument(
-        "--stats-path",
-        default="meta/stats.json",
-        help="统计文件路径（相对输出目录或绝对；默认 meta/stats.json）",
-    )
-    parser.add_argument(
-        "--split-path", default=None, help="显式 split 文件路径（可选）"
-    )
-    parser.add_argument(
-        "--split-rules",
-        default="by_episode",
-        help="split 规则说明（默认 by_episode）",
-    )
-    parser.add_argument(
-        "--recommended-split",
-        default="train",
-        help="建议训练侧使用的 split（默认 train）",
-    )
-    parser.add_argument(
-        "--suggested-sampling-weight",
-        type=float,
-        default=1.0,
-        help="训练侧采样权重建议（默认 1.0，可被训练配置覆盖）",
+        "--robot-type", default="unknown", help="机器人类型（写入 lerobot info）"
     )
     return parser.parse_args()
 
@@ -1201,25 +908,9 @@ def main() -> int:
     if not str(args.repo_id).strip():
         logger.error("--repo-id 不能为空")
         return 1
-    if args.dataset_id is not None and not str(args.dataset_id).strip():
-        logger.error("--dataset-id 不能为空字符串")
-        return 1
-    if args.dataset_version is not None and not str(args.dataset_version).strip():
-        logger.error("--dataset-version 不能为空字符串")
-        return 1
     if not str(args.robot_type).strip():
         logger.error("--robot-type 不能为空")
         return 1
-    if args.suggested_sampling_weight <= 0:
-        logger.error("--suggested-sampling-weight 必须大于 0")
-        return 1
-    if args.split_path:
-        split_candidate = Path(args.split_path)
-        if not split_candidate.is_absolute():
-            split_candidate = output_dir / split_candidate
-        if not split_candidate.is_file():
-            logger.error("--split-path 指向的文件不存在：%s", split_candidate)
-            return 1
 
     # 校验必须在删旧目录之前：--force 会整个删掉已有数据集，若输入有问题就白丢了
     total_frames, problems = precheck_frames(
@@ -1284,22 +975,6 @@ def main() -> int:
             logger=logger,
         )
     except Exception:
-        return 1
-
-    try:
-        if write_dataset_manifest(
-            args,
-            info,
-            cameras,
-            episodes,
-            action_dim,
-            total_frames,
-            output_dir,
-            logger,
-        ):
-            return 1
-    except (OSError, ValueError):
-        logger.exception("生成 dataset_manifest.json 失败")
         return 1
 
     elapsed = time.time() - start_ts

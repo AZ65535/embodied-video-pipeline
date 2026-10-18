@@ -33,13 +33,6 @@ EPISODES_JSONL = "episodes.jsonl"
 TASKS_JSONL = "tasks.jsonl"
 INFO_JSON = "info.json"
 
-# ---- 数据集自描述与索引 ----
-MANIFEST_FILENAME = "dataset_manifest.json"
-INDEX_FILENAME = "datasets.json"
-PIPELINE_VERSION = "0.1.0"
-DATASET_MANIFEST_SCHEMA_VERSION = 1
-INDEX_SCHEMA_VERSION = 1
-
 # ---- 动作侧车（import_actions.py 写、export_lerobot.py 读）----
 ACTIONS_DIRNAME = "actions"
 ACTION_ARRAY = "action"  # npz 里的数组名

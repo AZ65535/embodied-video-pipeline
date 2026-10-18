@@ -614,11 +614,10 @@ def test_config_from_form_maps_multi_camera_fields():
     config = h.config_from_form(
         "in", "out", "ds", "ld", True, True, True, 5, 100, 60,
         "", "", "h264", "local/x", "normal",
-        "dir", "names.json", "droid_autolab", "droid",
+        "dir", "names.json", "droid",
     )
     assert config.group_by == "dir"
     assert config.camera_names == "names.json"
-    assert config.dataset_id == "droid_autolab"
     assert config.robot_type == "droid"
 
 

@@ -74,7 +74,6 @@ def test_multi_camera_export_roundtrip(tmp_path, tiny_jpegs, monkeypatch):
         monkeypatch,
         "--input", dataset_dir,
         "--output", out,
-        "--dataset-id", "multi_camera_test",
         "--robot-type", "droid",
     ) == 0
 
@@ -85,14 +84,3 @@ def test_multi_camera_export_roundtrip(tmp_path, tiny_jpegs, monkeypatch):
     assert item["observation.images.b"].shape[0] == 3
     assert item["blur_score"].tolist() == pytest.approx([200.0, 50.0])
     assert int(item["source_frame"]) == 0
-
-    manifest = json.loads((out / pc.MANIFEST_FILENAME).read_text(encoding="utf-8"))
-    assert manifest["dataset_id"] == "multi_camera_test"
-    assert manifest["robot_type"] == "droid"
-    assert manifest["num_episodes"] == 1
-    assert manifest["num_samples"] == 3
-    assert manifest["num_camera_frames"] == {"a": 3, "b": 3}
-    assert [camera["name"] for camera in manifest["cameras"]] == ["a", "b"]
-    assert manifest["manifest_status"] == "partial"
-    assert manifest["content_hash"].startswith("sha256:")
-    assert manifest["dataset_version"] == manifest["content_hash"].split(":", 1)[1][:12]

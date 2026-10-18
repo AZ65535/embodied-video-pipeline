@@ -25,9 +25,8 @@ mp4 各自成集（`--group-by file`，默认）。每个导出结果都是**同
 | 1 | `clean_video.py` | 抽帧、记录每帧的模糊分数 | OpenCV |
 | 2 | `format_dataset.py` | 生成帧清单，按阈值标记模糊帧 | 标准库 |
 | — | `import_actions.py` | **可选**：把外部动作记录转成侧车，供第三步消费 | numpy（droid 格式另需 h5py） |
-| 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集，并写 `dataset_manifest.json` | lerobot |
+| 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集 | lerobot |
 | — | `run_pipeline.py` | 一条命令串行执行三步 | 标准库 |
-| — | `build_dataset_index.py` | 扫描多个数据集，生成可重建的 `datasets.json` | 标准库 |
 | — | `ui.py` | **可选**：本地网页界面（运行 + 模糊复核） | gradio（`requirements-ui.txt`） |
 
 第二步的产物 `dataset/` 是**中间产物**，供第三步消费。它可读、可查、便于调试，但不是
@@ -88,14 +87,15 @@ videos/ ──①──▶ output/images/ ──②──▶ dataset/ ──③�
 
 ```bash
 python run_pipeline.py --input videos --group-by dir \
-    --camera-names names.json \
-    --dataset-id my_multicam --robot-type droid
+    --camera-names names.json --robot-type droid
 ```
 
-任何一步失败都会立刻停下，已生成的产物保留；修好后可以接着跑。常用开关：
+任何一步失败都会立刻停下；本次运行已生成的产物保留，修好后可以接着跑。注意 `--force`
+会先删除旧产物再重建（第三步尤其如此），旧数据集不会在失败时自动恢复。常用开关：
 
 | 参数 | 说明 |
 |---|---|
+| `--input` / `-i` | 输入视频目录（必填，递归扫描 mp4） |
 | `--skip-existing` | 跳过产物已完成的步骤（不会处理新增素材） |
 | `--force` | 允许覆盖已有产物（第三步会整个目录删掉重建） |
 | `--dry-run` | 只打印将执行的命令，不执行 |
@@ -106,7 +106,7 @@ python run_pipeline.py --input videos --group-by dir \
 | `--camera-names names.json` | dir 模式下把序列号映射成语义相机名 |
 | `--camera` | file 模式下同时用于第一步和第三步 |
 | `--task` / `--vcodec` / `--repo-id` | 透传给第三步 |
-| `--dataset-id` / `--robot-type` | 透传给第三步，写入数据集 manifest |
+| `--robot-type` | 透传给第三步，写入 LeRobot `meta/info.json` |
 
 需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面的步骤脚本和辅助工具。
 
@@ -171,6 +171,9 @@ videos/AUTOLab/episode_001/
 ```json
 {"18026681": "cam_1", "22008760": "cam_2", "24400334": "cam_3"}
 ```
+
+相机名会进入 feature 名和文件路径，不能包含 `/`、`\` 等路径分隔符或其他 Windows
+非法字符，也不能是 `CON`、`NUL` 这类保留设备名。
 
 **同一个数据集内所有 episode 的相机集合必须一致**（lerobot 只有一套全局 features）。
 不同实验室的序列号不同时，要么用映射统一，要么拆成多个数据集 —— 不要指望管线自动猜。
@@ -364,10 +367,7 @@ python export_lerobot.py --input dataset --output lerobot_dataset
 | `--vcodec` | `h264` | 视频编码器，见下 |
 | `--images-root` | 取 `info.json` 的 `extras.image_root` | 第一步图片目录；移动过目录或只保留清单时显式指定 |
 | `--force` | 关 | 输出目录已存在时**整目录删掉重建** |
-| `--dataset-id` / `--dataset-version` | 见下 | 数据集逻辑 ID / 物理版本；写入 manifest |
-| `--robot-type` / `--action-space-id` / `--state-space-id` / `--control-mode` | `unknown` | 训练侧语义字段 |
-| `--stats-path` / `--split-path` / `--split-rules` / `--recommended-split` | 见下 | 统计与 split 契约 |
-| `--suggested-sampling-weight` | `1.0` | 跨数据集采样权重建议 |
+| `--robot-type` | `unknown` | 机器人类型，写入 LeRobot `meta/info.json` |
 
 `meta/` 下的 parquet 与 `info.json` 全部由 lerobot 自己生成，脚本只负责喂数据。这样格式
 正确性由官方代码保证；lerobot 升级格式时跟着升级 API 即可，无需重新逆向。
@@ -431,7 +431,6 @@ frame["observation.state"]           # (A,) 状态；同上
 
 ```
 lerobot_dataset/
-├── dataset_manifest.json                   # 本管线写的权威自描述（不属于 lerobot 格式）
 ├── data/chunk-000/file-000.parquet         # 数值列（timestamp/source_frame/blur_score…）
 ├── videos/
 │   ├── observation.images.cam_1/chunk-000/file-000.mp4
@@ -443,50 +442,22 @@ lerobot_dataset/
     └── episodes/chunk-000/file-000.parquet # 每集在 parquet 与 mp4 里的起止位置
 ```
 
-每个相机一路视频流，帧按大小轮转；一个文件可含多个 episode。`dataset_manifest.json`
-不修改 lerobot 生成的 `meta/info.json`，避免未知字段告警。
+每个相机一路视频流，帧按大小轮转；一个文件可含多个 episode。
 
 视频文件按 `video_files_size_in_mb`（lerobot 默认 200 MB）轮转，一个文件可容纳多个
 episode；parquet 同理按 `data_files_size_in_mb`（默认 100 MB）轮转。
 
-### 数据集 manifest 与索引
+### 交给训练侧
 
-`lerobot_dataset/dataset_manifest.json` 是**唯一权威自描述**。关键字段：
+导出的 `lerobot_dataset/` 不依赖本仓库，也不依赖 `videos/`、`output/images` 或 `dataset/`。
+把整个目录拷贝到训练机器后，训练项目只需要：
 
-| 字段 | 含义 |
-|---|---|
-| `schema_version` | manifest 结构版本 |
-| `dataset_id` | 稳定逻辑 ID；`--dataset-id`，缺省用 `repo_id`，与路径无关 |
-| `dataset_version` / `content_hash` | 物理版本；缺省取 `content_hash` 前 12 位 |
-| `manifest_status` | `complete` / `partial`；语义字段未知时是 `partial` |
-| `num_episodes` / `num_samples` / `num_camera_frames` | episode 数、同步采样数、每路相机帧数 |
-| `cameras` | 相机名、shape、原始 fps，顺序与 `blur_score` 向量一致 |
-| `action_dim` / `state_dim` | 动作/状态维度；无动作时为 `null` |
-| `action_space_id` / `state_space_id` / `control_mode` / `units` / `joint_order` | 动作语义；不知道就保持 `unknown` / `null` |
-| `stats_path` / `stats_status` / `stats_split` | 统计量位置与状态 |
-| `split_path` / `split_rules` / `recommended_split` | split 优先级：显式文件 > 规则 > 建议 |
-| `suggested_sampling_weight` | 跨数据集采样权重建议，训练配置必须能覆盖 |
-| `source` | 原始根目录、分组方式、相机名映射；不参与 ID |
-
-`content_hash = sha256(manifest 内容字段 + meta/info.json + 相对文件索引)`；来源路径、
-创建时间等自引用字段不参与，**不哈希像素**。
-同一份素材重跑应得到相同版本；只改像素而文件路径/大小不变时 hash 可能不变，这是当前
-记录下来的已知限制。
-
-`build_dataset_index.py` 扫描一个根目录下的所有 manifest，生成可重建的 `datasets.json`：
-
-```bash
-python build_dataset_index.py --root D:/datasets --output D:/datasets/datasets.json
+```python
+ds = LeRobotDataset("local/embodied-videos", root="/data/lerobot_dataset")
 ```
 
-索引只是缓存：删掉可随时重建。冲突规则是硬错误 —— 同一 `(dataset_id, dataset_version)`
-出现在两个路径、同一路径出现多条记录、manifest 读取失败，都会中止而不是静默跳过。
-`--infer-legacy` 可以把没有 manifest 的旧数据集按 `partial` 临时登记。
-
-**训练侧最小契约**：按 `dataset_manifest.json` 发现和采样数据集；按 source 应用各自的
-transform、统计量和动作映射；`manifest_status=partial` 的数据集不要直接用于跨机器人
-动作映射，除非训练配置显式忽略语义字段。每个数据集内部是同构的，跨数据集混合不需要
-黑图补齐；如果将来要合并成单一数据集，再引入每帧 `source_id` / `camera_mask`。
+“用哪些数据集、采样权重、train/val 划分、transform、动作映射”属于训练配置，由训练项目
+维护，本管线不生成这些配置。
 
 ### 时间轴：由构造保证均匀
 
@@ -582,9 +553,16 @@ python import_actions.py --format droid --group-by file --input videos --dataset
 python import_actions.py --format droid --group-by dir  --input videos --dataset dataset
 ```
 
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--format` | `droid` | 动作记录格式；目前只有 DROID 适配器 |
+| `--group-by` | `file` | 必须与第一步一致；不一致会报错 |
+| `--input` / `-i` | 必填 | 原始素材目录，与第一步的 `--input` 相同 |
+| `--dataset` / `-d` | `dataset` | 第二步产物目录，侧车写进它的 `meta/actions/` |
+| `--force` | 关 | 已存在的 `.npz` 也重新转换 |
+
 排位在**第二步之后、第三步之前**（不在三步管线里，但第三步依赖它的产物）。它回答一个问题：
 这份数据集能不能训练策略。只有 observation 的话只能训世界模型、视频预测那一类（见「已知限制」）。
-`--group-by` 必须与第一步一致；不一致会直接报错，避免动作静默配错。
 
 ### 为什么单开一个脚本
 
@@ -632,6 +610,9 @@ python import_actions.py --format droid --group-by dir  --input videos --dataset
 
 只给一部分 episode 动作是不行的（lerobot 要求声明的特征每帧都有）。要么补齐，要么把那些
 素材从 `videos/` 里排除。
+
+重跑第二步不会清理 `dataset/meta/actions/` 里旧 episode 的 npz；素材集合变化时建议换一个
+输出目录，或手动清理不再需要的侧车。
 
 ---
 
@@ -685,7 +666,7 @@ Laplacian 方差分布通常不是双峰的，所以工具不自动推荐阈值�
 ## 测试
 
 ```bash
-pytest            # 319 个用例，约 5 秒
+pytest            # 296 个用例，约 5 秒
 pytest -m slow    # 9 个用例，含真实调用 lerobot，约 10 秒
 ```
 
@@ -718,3 +699,9 @@ observation —— 动作推不出来，必须有另外的来源（机器人日�
 `import_actions.py` 目前只带一个 DROID 适配器。换数据源要自己加一个 `find_*_sources`
 （从素材目录找到动作文件）和一个 `load_*`（读出来并拼成 `(N, A)`）。Dir 模式下适配器
 需要按 episode 目录返回**一个**动作源；转换本身是格式适配，不涉及管线逻辑。
+
+### 没有数据集版本号
+
+导出的 LeRobot 数据集不额外写 manifest 或 content hash。重导出到同一路径时会覆盖旧产物；
+需要保留多个版本时，在训练侧用目录管理，例如 `datasets/droid_autolab/v1/`。已有数据集里
+如果还留着旧版 `dataset_manifest.json`，LeRobot 不会读取，可以直接删除。

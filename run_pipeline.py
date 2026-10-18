@@ -29,7 +29,6 @@ from pipeline_common import (
     DEFAULT_REPO_ID,
     IMAGES_META_FILENAME,
     INFO_JSON,
-    MANIFEST_FILENAME,
     META_DIRNAME,
 )
 
@@ -134,8 +133,6 @@ def build_steps(
         export_cmd += ["--task", args.task]
     if args.vcodec is not None:
         export_cmd += ["--vcodec", args.vcodec]
-    if args.dataset_id is not None:
-        export_cmd += ["--dataset-id", args.dataset_id]
     if args.robot_type is not None:
         export_cmd += ["--robot-type", args.robot_type]
     if args.force:
@@ -163,10 +160,7 @@ def build_steps(
             number=3,
             title="导出 LeRobot 数据集",
             cmd=export_cmd,
-            done_markers=(
-                lerobot_dir / META_DIRNAME / INFO_JSON,
-                lerobot_dir / MANIFEST_FILENAME,
-            ),
+            done_markers=(lerobot_dir / META_DIRNAME / INFO_JSON,),
             forceable=True,
         ),
     ]
@@ -263,12 +257,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--repo-id", default=DEFAULT_REPO_ID, help=f"数据集标识（默认 {DEFAULT_REPO_ID}）"
     )
     parser.add_argument(
-        "--dataset-id",
-        default=None,
-        help="数据集稳定逻辑 ID（默认用 repo_id；多数据集场景建议显式指定）",
-    )
-    parser.add_argument(
-        "--robot-type", default=None, help="机器人类型（写入 manifest 与 lerobot info）"
+        "--robot-type", default=None, help="机器人类型（写入 lerobot info）"
     )
 
     group = parser.add_mutually_exclusive_group()
