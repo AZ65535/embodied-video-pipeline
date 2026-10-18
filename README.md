@@ -104,7 +104,8 @@ python run_pipeline.py --input videos --group-by dir \
 | `--blur-threshold` / `--max-episode-seconds` | 透传给第二步 |
 | `--group-by {file,dir}` | `file`=每个 mp4 一集；`dir`=同目录 mp4 是同集多相机（默认 `file`） |
 | `--camera-names names.json` | dir 模式下把序列号映射成语义相机名 |
-| `--camera` / `--task` / `--vcodec` / `--repo-id` | 透传给第三步（`--camera` 仅 file 模式） |
+| `--camera` | file 模式下同时用于第一步和第三步 |
+| `--task` / `--vcodec` / `--repo-id` | 透传给第三步 |
 | `--dataset-id` / `--robot-type` | 透传给第三步，写入数据集 manifest |
 
 需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面的步骤脚本和辅助工具。
@@ -175,8 +176,9 @@ videos/AUTOLab/episode_001/
 不同实验室的序列号不同时，要么用映射统一，要么拆成多个数据集 —— 不要指望管线自动猜。
 
 **同步是严格按帧的**：同一集各相机的采样帧数、`source_frame` 序列、原始 fps 必须完全一致；
-管线不做插值、补齐或时间戳对齐。任何一项不一致都会在第一步/第二步报错，而不是产出错位的
-数据集。相机在最终数据集中的顺序是自然排序后的 `cameras` 列表顺序。
+管线不做插值、补齐或时间戳对齐。第一步只检查相机集合和命名冲突，帧级同步校验在第二步
+完成；任何不一致都会报错，而不是产出错位的数据集。相机在最终数据集中的顺序是规范排序后的
+`cameras` 列表顺序。
 
 ### 输出名前缀
 
@@ -214,7 +216,8 @@ videos/AUTOLab/episode_001/
 {"video": "1", "source_frame": 6, "blur_score": 92.77}
 ```
 
-分数是原始值，不是「是否模糊」的布尔量 —— 阈值还没标定，判断留给第二步和下游。
+分数是原始值，不是「是否模糊」的布尔量；是否模糊由第二步的 `--blur-threshold`
+（以及下游自己的过滤策略）决定。
 
 ### `_meta.json`
 
@@ -264,7 +267,7 @@ python format_dataset.py --input output/images --output dataset
 | `--fps` | `5` | 应与第一步一致 |
 | `--group-by` | 读 `_meta.json` | 显式值与第一步记录不一致时报错 |
 | `--camera` | `front` | file 模式下的相机名；dir 模式不要传 |
-| `--camera-names` | 读 `_meta.json` | 相机名映射；同名条目会覆盖第一步记录 |
+| `--camera-names` | 无（沿用 `_meta.json` 记录） | 相机名映射；同名条目会覆盖第一步记录 |
 | `--blur-threshold` | `100` | 低于此分数在清单里标为模糊。**只标记，不删帧** |
 | `--max-episode-seconds` | `60` | 单个 episode 的时长上限，超长的视频切成多段；`0` = 不切 |
 | `--force` | 关 | 已存在清单时允许覆盖 |
@@ -290,8 +293,8 @@ python format_dataset.py --input output/images --output dataset
 ### 阈值只做标记
 
 `--blur-threshold` 决定 `frames.jsonl` 里 `is_blurry` 这一列怎么填，**不改变帧数**。
-判据是**严格小于**（恰好等于阈值算清晰）。三处（第一步、第二步、标定工具）共用
-`pipeline_common.is_blurry()`，口径只有一份。
+判据是**严格小于**（恰好等于阈值算清晰）。第二步和标定工具共用
+`pipeline_common.is_blurry()`，口径只有一份；第一步只记录原始分数，不做阈值判断。
 
 换阈值只需重跑这一步（秒级），不用重新解码视频 —— 这正是不把阈值放在第一步的原因。
 
@@ -336,7 +339,7 @@ LeRobot 数据集由第三步生成（v3.0）。
 | 2 | 从帧号间隔反推（`gcd(相邻帧号差) × --fps`） | ±2.5 fps |
 | 3 | 名义值 `frame_index / fps` | **时间轴偏小**，仅最后兜底 |
 
-每一帧实际使用了哪个来源，都写进了 `info.json` 的
+每一路视频（相机）实际使用了哪个来源，都写进了 `info.json` 的
 `extras.source_fps_origin_by_video`，生成的 `meta/README.md` 中也有对应说明。
 
 脚本同时做**交叉校验**：`_meta.json` 记录的帧率对应的步长应当等于从帧号反推的步长，
@@ -383,11 +386,11 @@ python export_lerobot.py --input dataset --output lerobot_dataset
 
 ### `--vcodec` 怎么选
 
-| 编码器 | 速度 | 解码代价 | 备注 |
+| 编码器 | 编码 | 解码代价 | 备注 |
 |---|---|---|---|
-| `h264`（默认） | 中等 | 较低 | 各种尺寸都能用（宽高须为偶数，见下方说明） |
-| `libsvtav1` | 较慢 | 较高 | **极小尺寸的帧会让进程直接崩** |
-| `auto` | 最快（走硬件编码器） | 视硬件而定 | 硬件编码器有最小尺寸要求，小图会失败 |
+| `h264`（默认） | 软件编码，兼容性最好 | 较低 | 各种尺寸都能用（宽高须为偶数，见下方说明） |
+| `libsvtav1` | 软件编码，压缩率更高 | 较高 | **极小尺寸的帧会让进程直接崩** |
+| `auto` | 硬件编码，速度取决于驱动/素材 | 视硬件而定 | 硬件编码器有最小尺寸要求，小图会失败 |
 
 默认选 `h264`，因为尺寸鲁棒、解码最快、软件编码到处可用。素材都是大尺寸且机器有硬件
 编码器时，`--vcodec auto` 能明显加快写入。
@@ -415,14 +418,14 @@ frame = ds[0]
 frame["observation.images.cam_1"]    # (3, H, W) float32，取值 [0, 1]，按需从视频解码
 frame["observation.images.cam_2"]    # 每路相机一个特征，shape 可以不同
 frame["timestamp"]                   # 相对本 episode 起点的时间戳，见下
-frame["source_frame"]                # 原始视频里的帧号（跨 episode 唯一）
+frame["source_frame"]                # 原始帧号；同一源视频内跨 episode 唯一，不同视频会重叠
 frame["blur_score"]                  # (C,) Laplacian 方差；顺序与相机顺序一致
 frame["action"]                      # (A,) 动作；只有接了动作数据才有（见「接动作数据」）
 frame["observation.state"]           # (A,) 状态；同上
 ```
 
-`blur_score` 是一列向量：第 i 维对应 `info.json` 中第 i 个 `observation.images.*` 特征，
-特征本身也带 `names = [相机名...]`。单相机数据集仍是 `(1,)`，与旧行为一致。
+`blur_score` 是一列向量：第 i 维对应 `info.json` 中第 i 个 `observation.images.*` 特征；
+`blur_score` 特征的 `names` 就是相机名列表。单相机数据集仍是 `(1,)`，与旧行为一致。
 
 ### 数据集结构
 
@@ -465,7 +468,8 @@ episode；parquet 同理按 `data_files_size_in_mb`（默认 100 MB）轮转。
 | `suggested_sampling_weight` | 跨数据集采样权重建议，训练配置必须能覆盖 |
 | `source` | 原始根目录、分组方式、相机名映射；不参与 ID |
 
-`content_hash = sha256(manifest 字段 + meta/info.json + 相对文件索引)`，**不哈希像素**。
+`content_hash = sha256(manifest 内容字段 + meta/info.json + 相对文件索引)`；来源路径、
+创建时间等自引用字段不参与，**不哈希像素**。
 同一份素材重跑应得到相同版本；只改像素而文件路径/大小不变时 hash 可能不变，这是当前
 记录下来的已知限制。
 
@@ -496,7 +500,7 @@ lerobot 的 `add_frame()` 把 timestamp 硬编码为 `frame_index / fps`，且�
 | 列 | 含义 |
 |---|---|
 | `timestamp` | `frame_index / fps`，即相对本 episode 起点的秒数 |
-| `source_frame` | 原始视频里的帧号；同一集内各路相机共享，**在同一个源视频内跨 episode 唯一**（切分不会让它重置），但不同视频的帧号会重叠 —— 绝对来源要结合 episode/`source_videos` |
+| `source_frame` | 原始视频里的帧号；同一集内各路相机共享，**在同一个源视频内跨 episode 唯一**（切分不会让它重置），但不同视频的帧号会重叠 —— 绝对来源要结合 episode 编号和第二步 `episodes.jsonl` 的 `source_videos` |
 | `blur_score` | 该帧各相机的 Laplacian 方差，长度 C，顺序与相机特征一致；**下游按它自行过滤** |
 
 要还原绝对时间：第二步产物 `dataset/meta/episodes.jsonl` 里每集都有
@@ -668,7 +672,7 @@ review/
 └── scores.jsonl
 ```
 
-文件名以分数开头（`var0000183.42_1_frame000123.jpg`），所以**按名称排序就是按质量排序**。`below/` 末尾与 `critical/` 开头相接，那里就是阈值所在的位置：看有没有该留的被丢了（误杀）、该丢的被留了（漏网）。
+文件名以分数开头（`var000183.42_1_frame000123.jpg`），所以**按名称排序就是按质量排序**。`below/` 末尾与 `critical/` 开头相接，那里就是阈值所在的位置：看有没有该留的被丢了（误杀）、该丢的被留了（漏网）。
 
 ### 不自动推荐阈值
 
