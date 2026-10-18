@@ -293,7 +293,7 @@ def check_encoder_drops(dataset, label: str, logger: logging.Logger) -> None:
     """
     # 挂载位置随版本变过：0.4.x 是 dataset._streaming_encoder，0.6 起 create() 把它
     # 交给 DatasetWriter 保管，于是变成 dataset.writer._streaming_encoder。
-    # 也就是说现在这一条依赖着两处私有结构，比升级前更脆（见 ROADMAP 中#3）。
+    # 也就是说现在这一条依赖着两处私有结构，比升级前更脆。
     writer = getattr(dataset, "writer", None)
     encoder = getattr(writer, "_streaming_encoder", None)
     dropped = getattr(encoder, "_dropped_frames", None)

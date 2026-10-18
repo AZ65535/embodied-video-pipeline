@@ -22,6 +22,8 @@ videos/*.mp4 ──①clean_video.py──▶ output/images/*.jpg ──②forma
 | 2 | `format_dataset.py` | 生成帧清单，按阈值标记模糊帧 | 标准库 |
 | — | `import_actions.py` | **可选**：把外部动作记录转成侧车，供第三步消费 | numpy（droid 格式另需 h5py） |
 | 3 | `export_lerobot.py` | 组装成 LeRobot v3.0 数据集 | lerobot |
+| — | `run_pipeline.py` | 一条命令串行执行三步 | 标准库 |
+| — | `ui.py` | **可选**：本地网页界面（运行 + 模糊复核） | gradio（`requirements-ui.txt`） |
 
 第二步的产物 `dataset/` 是**中间产物**，供第三步消费。它可读、可查、便于调试，但不是
 LeRobot 数据集。`import_actions.py` 排在第二步之后、第三步之前——它只写 `dataset/meta/actions/`，
@@ -43,8 +45,9 @@ pip install -r requirements.txt
 ```
 
 **需要 Python 3.12 或更高**（lerobot 0.6 起的要求；本项目在 Python 3.12 的 conda 环境
-`line2` 上开发验证）。前两步需要 `opencv-python`、`numpy`、`tqdm`、`pytest`；第三步另外
-需要 `pillow` 和 `lerobot`（含 torch，约 1~2 GB），**只跑前两步可以不装**。
+`line2` 上开发验证）。第一步需要 `opencv-python`、`numpy`、`tqdm`；第二步只用标准库；
+第三步另外需要 `pillow` 和 `lerobot`（含 torch，约 1~2 GB），**只跑前两步可以不装**。
+跑测试需要 `pytest`；本地界面另需 `requirements-ui.txt` 里的 Gradio。
 
 第三步装的是 `lerobot[dataset]`——0.6 把 `datasets`/`pyarrow`/`torchcodec` 挪进了这个
 可选组，裸装 `lerobot` 写不出数据集。另外 `av` 需要显式安装：lerobot 0.6.1 把它从依赖里
@@ -52,7 +55,7 @@ pip install -r requirements.txt
 
 **装完还要卸掉一个**：`pip uninstall -y torchcodec`。它在 Windows 上找不到匹配的 FFmpeg
 共享库，留着每次 import 都会崩一段 traceback 再退回 pyav；卸掉只剩一行提示，行为完全一样
-（我们本来就用 pyav）——它只影响训练时读数据的速度，与写数据集无关。详见 ROADMAP 低#7。
+（我们本来就用 pyav）——它只影响训练时读数据的速度，与写数据集无关。
 
 装 lerobot 时 pip 会用 `opencv-python-headless` 覆盖已有的 `opencv-python`（两者共用
 `cv2/` 目录），见第三步的注意事项。
@@ -82,10 +85,12 @@ videos/ ──①──▶ output/images/ ──②──▶ dataset/ ──③�
 | `--skip-existing` | 跳过产物已完成的步骤（不会处理新增素材） |
 | `--force` | 允许覆盖已有产物（第三步会整个目录删掉重建） |
 | `--dry-run` | 只打印将执行的命令，不执行 |
+| `--fps` | 处理帧率，第一步与第二步共用（默认 5） |
+| `--output` / `--dataset` / `--lerobot` | 三个产物的目录（默认 output / dataset / lerobot_dataset） |
 | `--blur-threshold` / `--max-episode-seconds` / `--link-mode` | 透传给第二步 |
 | `--camera` / `--task` / `--vcodec` / `--repo-id` | 透传给第三步（`--camera` 同时用于第二步） |
 
-需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面三个脚本和辅助工具。
+需要更细的控制（单独跑某一步、标定阈值、接动作数据）时，用下面的步骤脚本和辅助工具。
 
 ## 可视化界面（可选）
 
@@ -97,7 +102,7 @@ python ui.py
 浏览器打开终端打印的 `http://127.0.0.1:7860`（端口被占用时会顺延）。两个页面：
 
 - **运行管线**：填输入/输出目录，勾选要跑的步骤，运行/停止，实时看日志。第 2 步完成后会自动刷新数据集摘要（episode 数、帧数、阈值、尺寸、每源视频分布、磁盘占用），也可以在跑第 3 步前手动刷新做预检。
-- **模糊复核**：读取 `<第 1 步输出根目录>/images/_scores.jsonl`，按分数浏览缩略图，拖动阈值实时看各视频的标记比例；确认后可一键用该阈值重跑第 2 步（只改 `is_blurry`，不删帧）。
+- **模糊复核**：读取 `<第 1 步输出根目录>/images/_scores.jsonl`，按分数浏览缩略图，调整阈值实时看各视频的标记比例；确认后可一键用该阈值重跑第 2 步（只改 `is_blurry`，不删帧）。
 
 界面只监听 `127.0.0.1`，不上传数据；Gradio 是可选依赖，不装也不影响三步 CLI 和 `run_pipeline.py`。若 pip 镜像超时，加 `-i https://pypi.org/simple/`。部分 Windows 环境的系统代理会拦截 Gradio 的 localhost 健康检查，`ui.py` 已自动把 `127.0.0.1,localhost` 加入 `NO_PROXY`。
 
@@ -117,7 +122,7 @@ python clean_video.py --input ./videos --output ./output --fps 5
 
 **这里没有阈值参数。** 第一步是纯机械操作：解码、按目标帧率采样、算每帧的 Laplacian
 方差、全部存盘。不做任何取舍判断，因此这一步跑完的产物是不可逆素材的完整保留
-（抽帧是最慢的一步，三个视频 155 秒）。
+（抽帧是最慢的一步）。
 
 多进程并行处理所有视频，结束后打印 Benchmark 汇总表，**报每个视频的分数中位数** ——
 中位数不需要阈值就能看出素材有多模糊。
@@ -182,9 +187,6 @@ python clean_video.py --input ./videos --output ./output --fps 5
 先写 `.tmp` 再原子替换，避免崩溃留下半截 JSON；重复运行是**合并**而非覆盖，可以分批向
 同一输出目录追加。`_scores.jsonl` 用同一套写法，合并粒度是「按视频整段替换」。
 
-（format 1 是旧版：那里有 `blur_threshold`、`saved`、`skipped_blurry`，且第一步会丢帧。
-第二步读 `_meta.json` 只用到 `orig_fps` 和 `target_fps`，两个版本都能读。）
-
 ---
 
 ## 第二步：生成帧清单
@@ -226,13 +228,13 @@ python format_dataset.py --input output/images --output dataset
 ### 阈值只做标记
 
 `--blur-threshold` 决定 `frames.jsonl` 里 `is_blurry` 这一列怎么填，**不改变帧数**。
-判据是**严格小于**（恰好等于阈值算清晰），口径与 `clean_video.is_frame_blurry()`、
-`calibrate_blur.filter_rate()` 一致。
+判据是**严格小于**（恰好等于阈值算清晰）。三处（第一步、第二步、标定工具）共用
+`pipeline_common.is_blurry()`，口径只有一份。
 
 换阈值只需重跑这一步（秒级），不用重新解码视频 —— 这正是不把阈值放在第一步的原因。
 
-改完之后汇总行会报「按此阈值有多少帧会被标为模糊」。若上游没留下 `_scores.jsonl`
-（旧版产物），`blur_score` 与 `is_blurry` 记为 `null` 并给出提示，不会让流程失败。
+改完之后汇总行会报「按此阈值有多少帧会被标为模糊」。若上游没有留下 `_scores.jsonl`，
+`blur_score` 与 `is_blurry` 记为 `null` 并给出提示，不会让流程失败。
 
 ### 产物结构
 
@@ -305,39 +307,33 @@ python export_lerobot.py --input dataset --output lerobot_dataset
 
 ### 帧编成视频，不嵌进 parquet
 
-相机特征声明为 `dtype: "video"`，帧交给 lerobot 编码成 mp4（**每个 episode 一个文件**），
-parquet 里只放数值列。这是 lerobot 的默认模式，也是生态惯例 ——
+相机特征声明为 `dtype: "video"`，帧交给 lerobot 编码成 mp4（按大小轮转，**一个文件
+可容纳多个 episode**），parquet 里只放数值列。这是 lerobot 的默认模式，也是生态惯例 ——
 [DROID](https://droid-dataset.github.io/droid/the-droid-dataset) 原始数据是 8.7 TB 的 mp4，
 [LeRobot v3.0](https://dctx-team.github.io/lerobot-zh/zh/lerobot-dataset-v3/) 的设计目标之一
 就是「chunked parquet + compressed videos」。
 
-**为什么不用「图片字节嵌进 parquet」**（`dtype: "image"`）—— 那条路在大数据量下有两个硬限制：
+**为什么不用「图片字节嵌进 parquet」**（`dtype: "image"`）—— 有两个硬限制：单个 arrow
+批次超过约 2 GB 会因 int32 偏移溢出而失败；写一个 episode 时，全部帧要同时驻留内存
+（1080p × 1000 帧 ≈ 6.2 GB）。视频模式两者都没有，代价是**有损编码**，解码也比读图片慢。
 
-1. 单个 arrow 批次超过约 2 GB 会报 `offset overflow while concatenating arrays`
-   （二进制列用 int32 偏移）。这是[已知问题](https://github.com/huggingface/datasets/issues/6206)，
-   标准修法是调小批次，但批次大小由 lerobot 内部决定，我们够不着。
-2. 写一个 episode 时，该 episode 的**全部帧**要同时驻留内存（1080p × 1000 帧 ≈ 6.2 GB）。
-   episode 越长、分辨率越高，越接近 OOM。
-
-视频存储两个都没有。代价是**有损编码**（且解码比读图片慢，见下）。
-
-**实测体积**（本仓库 2674 帧 1080p）：视频模式 **220 MB**，同样内容图片模式会写到 5 GB 以上
-（上一版实测 5.2 GB 时因撞上第 1 条限制而失败）。约 24 倍。
+**实测体积**（2674 帧 1080p 示例素材）：视频模式 **220 MB**；同样内容用图片模式会写到
+5 GB 以上，并因第 1 条限制失败。约 24 倍。
 
 ### `--vcodec` 怎么选
 
 | 编码器 | 编码速度（1080p 实测） | 解码代价 | 备注 |
 |---|---|---|---|
-| `h264`（默认） | ~8.5 fps | 约为读图片的 **2.2 倍** | 各种尺寸都能用（宽高须为偶数，见「已知限制 7」） |
+| `h264`（默认） | ~8.5 fps | 约为读图片的 **2.2 倍** | 各种尺寸都能用（宽高须为偶数，见下方说明） |
 | `libsvtav1` | ~17.9 fps | 约为读图片的 **5 倍** | **16×32 这种小图会让进程直接崩** |
 | `auto` | 最快（走硬件编码器） | 视硬件而定 | 硬件编码器有最小尺寸要求，小图会失败 |
 
-编码速度是实测值（1080p、`g=2`、`crf=30`，lerobot 硬编码这两个参数），解码倍数是
-[LeRobot issue #1623](https://github.com/huggingface/lerobot/issues/1623) 的实测 ——
-那位用 4 路相机训练时，**等 dataloader 1 秒、反向传播只要 0.7 秒**。
+编码速度是 1080p、`g=2`、`crf=30` 下的实测值；默认选 `h264`，因为尺寸鲁棒、解码最快、
+软件编码到处可用。素材都是大尺寸且机器有硬件编码器时，`--vcodec auto` 能明显加快写入。
 
-默认选 `h264` 是因为它在三个维度上都不吃亏：尺寸鲁棒、解码最快、软件编码到处可用。
-素材都是大尺寸、且机器有硬件编码器时，`--vcodec auto` 能明显加快写入。
+> 编码器使用 `yuv420p`，要求宽高都是偶数。普通摄像头 / h264 素材不会踩到；ProRes、
+> RGB、4:4:4 等非 4:2:0 素材若带奇数尺寸，先在输入侧补齐：
+> `ffmpeg -i 原视频.mp4 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" 新视频.mp4`
 
 ### 流式编码会丢帧，脚本会检查
 
@@ -369,11 +365,11 @@ frame["observation.state"]           # (A,) 状态；同上
 lerobot_dataset/
 ├── data/chunk-000/file-000.parquet         # 数值列（timestamp/source_frame/blur_score…）
 ├── videos/observation.images.front/
-│   └── chunk-000/file-000.mp4              # 帧编码成的视频，一个 episode 一段
+│   └── chunk-000/file-000.mp4              # 帧编码成的视频，按大小轮转；一个文件可含多个 episode
 └── meta/
     ├── info.json                           # features 定义，codebase_version = v3.0
     ├── stats.json                          # 各特征的统计量
-    ├── tasks.parquet                       # 任务标注；--task 为空时是一行空任务
+    ├── tasks.parquet                       # 任务表；--task 为空时只有 task_index=0
     └── episodes/chunk-000/file-000.parquet # 每集在 parquet 与 mp4 里的起止位置
 ```
 
@@ -395,8 +391,9 @@ lerobot 的 `add_frame()` 把 timestamp 硬编码为 `frame_index / fps`，且�
 | `source_frame` | 原始视频里的帧号；**在同一个源视频内跨 episode 唯一**（切分不会让它重置），但不同视频的帧号会重叠 —— 定位一帧要 `source_video` + `source_frame` |
 | `blur_score` | 该帧的 Laplacian 方差，**下游按它自行过滤** |
 
-要还原绝对时间：`episodes.jsonl` 里每集都有 `first_source_frame`，除以 `source_fps`
-再加上 `timestamp` 即可。
+要还原绝对时间：第二步产物 `dataset/meta/episodes.jsonl` 里每集都有
+`first_source_frame`，除以该集的 `source_fps` 再加上 `timestamp` 即可（`source_fps`
+未知时只能得到近似值）。
 
 `source_frame` 独立保留，是因为它不只是时间轴的中间量：将来按帧号 join 动作数据，或
 重算时间轴（如原始帧率被修正）都需要它。
@@ -404,7 +401,8 @@ lerobot 的 `add_frame()` 把 timestamp 硬编码为 `frame_index / fps`，且�
 #### 一个隐含前提：原始帧率是处理帧率的整数倍
 
 步长取 `round(原始帧率 / 目标帧率)`，只有整除时 `步长 / 原始帧率` 才恰好等于 `1/目标帧率`。
-本仓库三个视频都满足（30/5=6、25/5=5），所以时间轴精确。换成 24fps 素材采样到 5fps 时，
+例如 30fps / 25fps 素材采样到 5fps 时满足（30/5=6、25/5=5），时间轴精确。换成 24fps
+素材采样到 5fps 时，
 步长是 5，但 `5/24` 秒 ≠ `1/5` 秒，每帧偏约 8.3 ms 且随帧数累积。
 
 `export_lerobot.py` 会在写入前检查这一点并告警（同时也检查帧号是否连续），**但不中断** ——
@@ -412,10 +410,19 @@ lerobot 的 `add_frame()` 把 timestamp 硬编码为 `frame_index / fps`，且�
 
 #### 帧号有缺口时会告警
 
-若帧清单的 `source_frame` 不均匀（手工裁剪的素材、或混用了旧版产物），`delta_timestamps`
-会取到错误的时间点。这种情况在写入前也会被检查出来并告警。
+若帧清单的 `source_frame` 不均匀（手工裁剪的素材，或不同批次的产物混在一起），
+`delta_timestamps` 会取到错误的时间点。这种情况在写入前也会被检查出来并告警。
 
-要修就重跑前两步 —— 第一步现在不丢帧，正常产物不会有缺口。
+要修就重跑前两步 —— 第一步会保留全部采样帧，正常产物不会有缺口。
+
+#### `delta_timestamps` 的用法限制
+
+lerobot 把 `delta_timestamps` 的秒数按 `round(d * fps)` 换算成帧索引偏移，而不是按时间戳
+查找。只有帧等间隔时，「取前后 0.2 秒」才等价于「取前后一帧」；本管线保留全部采样帧，
+所以这个前提成立。
+
+`timestamp` 不能列进 `delta_timestamps`：视频型数据集要用 `item["timestamp"].item()` 定位
+视频帧，窗口化后它变成多元素张量，会抛 `RuntimeError`。窗口取位请用 `source_frame` 验证。
 
 **下游必须自己处理模糊帧。** 数据集完整保留了模糊帧（这是时间轴正确的前提），要用就得
 按 `blur_score` 过滤：
@@ -431,11 +438,9 @@ lerobot 的 `create()` 要求输出目录**不存在**，因此 `--force` 的语
 生成」，而非「往上覆盖」。重建结果必然是干净的，不存在上一轮的残留文件。（第二步的
 `--force` 行为不同，会保留旧文件，见「已知限制」。）
 
-**编码参数。** lerobot 0.6 把编码参数收进了 `RGBEncoderConfig`（`g`、`crf`、`pix_fmt`、
-`preset`……都可调），但**本脚本只传 `vcodec`**，其余保持默认，与旧版一致 —— `g=2`
-（**每 2 帧一个关键帧**）和 `crf=30`。短 GOP 是为随机访问优化的，代价是压缩率 ——
-这也是为什么视频模式省下的空间没有通用编码那么夸张（调研里常见 10~20 倍）。
-要调就改 `write_dataset()` 里那行 `RGBEncoderConfig(vcodec=vcodec)`。
+**编码参数。** 脚本只传 `vcodec`，其余用 lerobot 默认值：`g=2`（每 2 帧一个关键帧）、
+`crf=30`。短 GOP 是为随机访问优化的，压缩率会低一些。要调就改 `write_dataset()` 里的
+`RGBEncoderConfig(...)`。
 
 ### 注意事项
 
@@ -516,18 +521,21 @@ python import_actions.py --format droid --input videos --dataset dataset
 
 ## 辅助工具：模糊阈值标定
 
+`--blur-threshold` 的值有两种确定方式，读取的都是第一步的 `_scores.jsonl`：
+
+- **可视化界面（推荐）**：在「模糊复核」页调整阈值，实时看各视频的标记比例和缩略图；
+  确认后直接重跑第二步。
+- **命令行工具**：`calibrate_blur.py`，适合导出复核帧离线查看，或在没有 Gradio 的
+  环境里使用。
+
+命令行工具的用法：
+
 ```bash
 python calibrate_blur.py --input output/images --export-dir ./review
 ```
 
-不在三步管线里，回答一个问题：`--blur-threshold` 该设多少。
-
-**它读的是第一步的产物，不解码视频。** 每帧的分数 `clean_video.py` 已经算好存进
-`_scores.jsonl` 了，这里只是重新统计一遍 —— 所以本工具**不需要 cv2**，和第二步一样
-是纯标准库，跑完 2674 帧只要零点几秒（早先自己解码的版本要 155 秒）。
-
-顺带解决了原本的一致性隐患：以前靠「两处代码写着同一套采样规则」保证标定与实际标注
-看到的是同一批分数，现在读的就是同一份数据，一致性是事实而不是约定。
+**它读的是第一步的产物，不解码视频。** 每帧的分数已经存在 `_scores.jsonl` 里，这里只做
+统计；通常零点几秒就能跑完。标定与第二步读的是同一份分数，口径一致。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -552,24 +560,9 @@ review/
 
 ### 不自动推荐阈值
 
-Laplacian 方差分布通常不是双峰的，任何自动选阈值的做法都是假装有依据。工具只给事实，线画在哪由人决定 —— 这也正是要导出复核帧的原因。
-
-### 实测：仓库里这三个视频的问题
-
-| | 视频 1 | 视频 2 | 视频 3 |
-|---|---|---|---|
-| 方差中位数 | 168.7 | 407.4 | 633.9 |
-| 阈值 100 会标为模糊的比例 | 18.2% | 11.2% | 9.5% |
-| 阈值 300 会标为模糊的比例 | 85.1% | 36.2% | 23.2% |
-
-（这些比例现在是「会被标记的比例」，不再是「会被丢弃的比例」—— 帧一律保留。）
-
-两点结论：
-
-1. **各视频中位数相差 3.8 倍**，同一个绝对阈值对它们的严格程度完全不同 —— 「统一阈值」实际上意味着各视频的标注标准不一致。工具在相差 2 倍以上时会主动告警。
-2. **阈值 300 对视频 1 是灾难性的**（标掉 85.1%），对视频 3 却只标 23.2%。所以「调高一点更保险」这个直觉在这批素材上不成立。
-
-复核帧里还能看到：部分被判为模糊的帧肉眼看是清晰的 —— 低对比或大面积平滑的画面，Laplacian 方差天然就低，与是否模糊无关。
+Laplacian 方差分布通常不是双峰的，所以工具不自动推荐阈值，只给出分布和复核帧，
+由使用人自己判断。低对比或大面积平滑的画面方差天然偏低，肉眼看未必模糊 —— 复核帧
+正是用来区分这种情况的。
 
 ---
 
@@ -584,11 +577,13 @@ pytest -m slow    # 8 个用例，含真实调用 lerobot，约 10 秒
 保持秒级；真正调用 lerobot 写入再读回的用例带 `slow` 标记，用于锁住 `finalize()` 这一
 调用 —— 漏掉它 parquet 不会写 footer，文件看似存在但无法加载。
 
-测试**不依赖** `videos/` 和 `output/`（两者都在 `.gitignore` 中），换台机器克隆后可直接
-运行。测试图片是三个不到 1KB 的真实 JPEG，见 `tests/fixtures/README.md`。
+**默认测试**不依赖 `videos/` 和 `output/`（两者都在 `.gitignore` 中），换台机器克隆后
+可直接运行；`-m slow` 的用例依赖真实素材，缺失时会自动跳过。测试图片是三个不到 1KB
+的真实 JPEG，见 `tests/fixtures/README.md`。
 
-两个 `main()` 的多进程端到端刻意未测 —— 运行慢、依赖进程调度、容易假失败，而其中逻辑已
-被 `process_video`、`write_images_meta` 和 `write_blur_scores` 分别覆盖。
+`clean_video.py` / `format_dataset.py` 的 `main()` 多进程端到端刻意未测 —— 运行慢、
+依赖进程调度、容易假失败，而其中逻辑已被 `process_video`、`write_images_meta` 和
+`write_blur_scores` 分别覆盖。
 
 ---
 
@@ -609,91 +604,15 @@ observation —— 动作推不出来，必须有另外的来源（机器人日�
 （从素材目录找到动作文件）和一个 `load_*`（读出来并并成 `(N, 8)`）——转换本身是格式适配，
 不涉及管线逻辑。
 
-### 2. `delta_timestamps` 已可用，但有三处要注意
-
-lerobot 把 `delta_timestamps` 的秒数按 `round(d * fps)` 换算成**帧索引偏移**，而不是按
-时间戳查找：
-
-```python
-delta_indices[key] = [round(d * fps) for d in delta_ts]     # utils.py:890
-```
-
-于是「取当前帧前后 0.2 秒」实际变成「取文件中前后一帧」。这只有在帧等间隔时才等价于
-按时间查找 —— 这正是本管线保留全部采样帧的原因。
-
-**改造前后的实测**（`fps=5`，请求前后各 0.2 秒，换算为帧偏移 `[-1, 0, +1]`）：
-
-| | 查询帧 | 该帧时间戳 | 取到的前一帧 | 「0.2 秒前」应为 |
-|---|---|---|---|---|
-| 改造前（丢帧留洞） | 第 51 帧 | 13.6 | **10.0**（偏 3.6 秒）❌ | 13.4 |
-| 改造后（全保留） | 第 51 帧 | 13.6 | 13.4 ✅ | 13.4 |
-
-改造前的整体情况：三个视频分别有 94.0% / 96.7% / 98.2% 的查询是对的，错的那
-1.8%~6.0% 最大偏 4.2 秒，**且不报错**。模糊帧是成片出现的（视频 1 丢 182 帧只造成
-49 个断点），所以错的位置不是均匀散布的。
-
-改造后仍然依赖的两个前提，写入前会自动检查并告警（**这两条只是告警而非中断** ——
-数据集本身仍然有效，只是时间戳不可尽信）：
-
-1. **原始帧率是处理帧率的整数倍**（见「第三步 → 时间轴」）。非整数倍时每帧有固定偏差。
-2. **帧号连续无缺口**。有缺口就说明上游丢了帧，时间轴重新出现空洞。
-
-**第三处不一样：`timestamp` 不能列进 `delta_timestamps`。** 视频型数据集在取数时要读一次标量
-`item["timestamp"]` 去定位视频里的帧：
-
-```python
-if len(self.meta.video_keys) > 0:
-    current_ts = item["timestamp"].item()        # lerobot_dataset.py:1099
-```
-
-开了窗口后 `timestamp` 变成多元素张量，`.item()` 直接抛
-`RuntimeError: a Tensor with 3 elements cannot be converted to Scalar`。这是 lerobot 的
-限制，绕不开 —— 窗口取位用 `source_frame` 验证即可。
-
-### 3. 下游必须自己过滤模糊帧
-
-这是第 2 条的代价。数据集完整保留了模糊帧（否则帧网格不均匀），所以：
-
-```python
-keep = ds.hf_dataset.filter(lambda row: row["blur_score"] >= 100)
-```
-
-**忘了这一步就等于把模糊帧当正常数据训练**，而且不会报错。第一次用这个数据集时，
-先看看 `blur_score` 列的分布。
-
-### 4. 模糊阈值该设多少尚无定论
-
-Laplacian 方差是**绝对量**，随分辨率、对比度和光照变化。`100` 是 OpenCV 教程中的常见值，
-通常针对 480p/720p 素材。
-
-标定工具已经就绪（见「辅助工具」一节，含实测数据），**但阈值最终改成多少还没定** ——
-复核帧需要人工翻过才能决定。`format_dataset.py` 的 `--blur-threshold` 默认值仍是 `100`。
-
-好在这个决定现在是**可逆的**：改阈值只需重跑第二步（秒级），不用重新解码视频。
-
-### 5. 重跑 `--force` 不会清理多余的旧文件
+### 2. 重跑 `--force` 不会清理多余的旧文件
 
 第二步的 `--force` 会保留旧文件：若改了 `--max-episode-seconds` 导致 episode 数变少，
-之前生成的 `episode_XXXXXX` 目录会残留在原处；帧数变多时也可能留下位置错位的旧文件
+上次运行生成的 `episode_XXXXXX` 目录会残留在原处；帧数变多时也可能留下位置错位的旧文件
 （帧文件名按 episode 内位置编号）。**改了切分长度就先把 `dataset/` 整个删掉再跑。**
 
 第三步的 `--force` 不同，它是整目录 `rmtree` 重建，不会留残渣。
 
-### 6. 硬链接的双向性
+### 3. 只支持单相机
 
-见「文件落盘方式」。`dataset/` 与 `output/images/` 共享同一份数据。
-
-### 7. 素材宽高必须是偶数
-
-视频编码器用 `yuv420p`（色度按 2x2 下采样），要求宽高都是偶数。**正常素材不会踩到** ——
-摄像头和 h264 都产不出奇数尺寸的 mp4，只有非 4:2:0 编码的（ProRes、RGB、4:4:4）才可能
-带奇数尺寸进来。
-
-真踩到时，第三步会在 lerobot 内部报 `Generic error in an external library`，**看不出是
-尺寸问题**，而且数据集已经写了一半。**管线不处理它**：不做补齐，也不改用 4:4:4 编码
-（实测体积几乎不变，但解码慢 3.4 倍）—— 正常素材遇不到，而补齐会成为整条管线上唯一
-悄悄改动像素的地方。在输入侧解决即可：
-
-```bash
-ffmpeg -i 原视频.mp4 -vf "pad=ceil(iw/2)*2:ceil(ih/2)*2" 新视频.mp4
-```
+一个 mp4 对应一个 episode。同一集的多路视角（如 DROID 的外部 + 腕部相机）会被拆成多个
+独立 episode，语义上是错的。当前管线尚未实现多相机支持。
